@@ -9,7 +9,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, codexUpgradeTarget } from '../src/server.js';
-import { relayCodexUpgrade, webSocketRefused, clearWebSocketRefusals } from '../src/codex-ws.js';
+import { relayCodexUpgrade, webSocketRefused, noteWebSocketRefused, clearWebSocketRefusals } from '../src/codex-ws.js';
 import { FrameDecoder, encodeFrame, closeFrame, parseClose, computeAccept, OPCODE } from '../src/ws-frames.js';
 import { setUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
 import { SessionTracker } from '../src/session-tracker.js';
@@ -707,4 +707,35 @@ test('an upstream 426 closes this connection and refuses the next upgrade with a
   }, { accounts: [codex('a')] });
   clearWebSocketRefusals();
   assert.equal(webSocketRefused('127.0.0.1'), false);
+});
+
+test('a refused host only refuses the upgrade outright when every candidate account sits behind it', async () => {
+  clearWebSocketRefusals();
+  noteWebSocketRefused('refused.invalid');
+  await withProxy({ 't-b': { ws: serve(0) } }, async ({ client, am, hits }) => {
+    am.accounts[0].upstream = 'http://refused.invalid:1';
+    // Unpinned: account b's host still speaks WebSockets, so no HTTP 426.
+    // Selection lands on a (lowest usage), whose host is known to refuse:
+    // a close, and no dial to it.
+    const c = await client();
+    assert.equal(c.status, 101, 'not refused while another account can serve');
+    c.send(create('gpt-5.4'));
+    const close = await c.closed();
+    assert.equal(close.code, 1011);
+    assert.match(close.reason, /426/);
+    assert.equal(hits.length, 0, 'the refusing host is not dialed');
+    // Pinned to b: served as usual.
+    const pinned = await client(`/tc-acct/b${RESPONSES}`);
+    assert.equal(pinned.status, 101);
+    pinned.send(create('gpt-5.4'));
+    assert.equal(JSON.parse(await pinned.text()).type, 'codex.rate_limits');
+    assert.equal(hits.length, 1);
+    // Pinned to a: its host is the only candidate, so an honest 426.
+    const refused = await client(`/tc-acct/a${RESPONSES}`);
+    assert.equal(refused.status, 426);
+    // Once b's host refuses too, an unpinned upgrade gets the 426 as well.
+    noteWebSocketRefused('127.0.0.1');
+    assert.equal((await client()).status, 426);
+  });
+  clearWebSocketRefusals();
 });

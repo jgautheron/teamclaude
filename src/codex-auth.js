@@ -94,16 +94,19 @@ export async function writeCodexCredentials(filePath, { accessToken, refreshToke
   const resolvedPath = filePath.replace(/^~/, home);
   const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
   // The file is shared, so it may no longer hold what was refreshed: the CLI
-  // may have logged into another account, or rotated the pair itself. Either
-  // way the file is newer than this process and must not be overwritten —
-  // a stale write would put one account's tokens under another's identity,
-  // or discard a rotation that already invalidated ours.
+  // may have logged into another account, rotated the pair itself, or
+  // switched to an API key (no token pair at all). Either way the file is
+  // newer than this process and must not be overwritten — a stale write
+  // would put one account's tokens under another's identity, or discard a
+  // rotation that already invalidated ours. `account_id` is optional in the
+  // CLI's file, so only a DIFFERENT one is evidence; a missing refresh token
+  // is, since the pair being replaced is exactly what was read from here.
   const current = raw.tokens || {};
   if (expectAccountId && current.account_id && current.account_id !== expectAccountId) {
     return { written: false, reason: `the file now holds account ${current.account_id}` };
   }
-  if (expectRefreshToken && current.refresh_token && current.refresh_token !== expectRefreshToken) {
-    return { written: false, reason: 'the file\'s refresh token was rotated by another process' };
+  if (expectRefreshToken && current.refresh_token !== expectRefreshToken) {
+    return { written: false, reason: current.refresh_token ? 'the file\'s refresh token was rotated by another process' : 'the file no longer holds a token pair' };
   }
   raw.tokens = { ...current, access_token: accessToken, refresh_token: refreshToken };
   raw.last_refresh = new Date().toISOString();
