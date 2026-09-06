@@ -781,6 +781,18 @@ export class AccountManager {
     return best ? best.index : null;
   }
 
+  /**
+   * Read-only: the account a request for `provider` would land on right now,
+   * or null. The fleet cursor names the current account of one pool; the
+   * dashboard asks this for the other pool's marker. Nothing is mutated.
+   */
+  previewProviderIndex(provider) {
+    const current = this.accounts[this.currentIndex];
+    if (current && providerOf(current) === provider && this._isAvailable(current)) return current.index;
+    const best = this._pickBestAvailable(this._excludeOtherProviders(null, provider));
+    return best ? best.index : null;
+  }
+
   _isProbeable(account) {
     if (!account) return false;
     // Never probe an account the operator has taken out of rotation or one
