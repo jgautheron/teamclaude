@@ -86,9 +86,9 @@ test('run --codex refuses when the proxy is down, unless --auto-fallback launche
 });
 
 test('run --codex reports a missing codex binary', async () => {
-  await withSandbox(async ({ run }) => {
+  await withSandbox(async ({ configPath }) => {
     const res = spawnSync(process.execPath, [cliPath, 'run', '--codex'], {
-      env: { ...process.env, TEAMCLAUDE_CONFIG: run.configPath, PATH: '/nonexistent' }, encoding: 'utf8', timeout: 15_000,
+      env: { ...process.env, TEAMCLAUDE_CONFIG: configPath, PATH: '/nonexistent' }, encoding: 'utf8', timeout: 15_000,
     });
     assert.equal(res.status, 1);
     assert.match(res.stderr, /Codex CLI not found in PATH/);
