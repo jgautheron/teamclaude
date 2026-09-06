@@ -245,3 +245,39 @@ test('an entitlement denial is neither quota nor credential', () => {
   assert.equal(classifyCodexRejection({ status: 500 }).kind, 'other');
   assert.equal(classifyCodexRejection({}).kind, 'other');
 });
+
+// ── Hardening from the opencodex history ────────────────────────────────────
+
+test('windows are classified by duration range, so an unusual burst or weekly duration is never dropped', () => {
+  // A 3h burst (seen on some plans), a 1-day window, a 6-day weekly, a 35-day month.
+  const q = parseCodexQuota({
+    'x-codex-primary-used-percent': '97', 'x-codex-primary-window-minutes': '180',
+    'x-codex-secondary-used-percent': '12', 'x-codex-secondary-window-minutes': '8640',
+    'x-codex-tertiary-used-percent': '40', 'x-codex-tertiary-window-minutes': '50400',
+  });
+  assert.equal(q.unified5h, 0.97, 'a sub-day window is the burst reading');
+  assert.equal(q.unified7d, 0.12, 'up to a month is the weekly reading');
+  assert.equal(q.unified30d, 0.4, 'a month or more is the monthly reading, and tertiary is read');
+  assert.equal(parseCodexQuota({ 'x-codex-primary-used-percent': '100', 'x-codex-primary-window-minutes': '720' }).unified5h, 1, 'a 12-hour window is still the burst window');
+  assert.equal(parseCodexQuota({ 'x-codex-primary-used-percent': '100', 'x-codex-primary-window-minutes': '1440' }).unified7d, 1, 'a full day is no longer a burst: it files as weekly');
+});
+
+test('a reset already in milliseconds is not multiplied again, and reset_after_seconds stands in for a missing reset_at', () => {
+  const ms = Date.now() + 3600_000;
+  const q = parseCodexQuota({ 'x-codex-primary-used-percent': '10', 'x-codex-primary-window-minutes': '10080', 'x-codex-primary-reset-at': String(ms) });
+  assert.equal(q.unified7dReset, ms);
+  const before = Date.now();
+  const ev = parseCodexRateLimitsEvent({ type: 'codex.rate_limits', rate_limits: { primary: { used_percent: 5, window_minutes: 10080, reset_after_seconds: 600 } } });
+  assert.ok(ev.unified7dReset >= before + 600_000 && ev.unified7dReset <= Date.now() + 600_000);
+  const usage = parseCodexUsagePayload({ rate_limit: { primary_window: { used_percent: 5, limit_window_seconds: 604800, reset_after_seconds: 60 } } });
+  assert.ok(usage.unified7dReset >= before + 60_000);
+});
+
+test('a wrapped or code-less quota refusal is still a spent quota, and a plain rate limit is not', () => {
+  const quota = (body) => classifyCodexRejection({ status: 429, headers: {}, body }).kind;
+  assert.equal(quota(JSON.stringify({ error: { error: { code: 'usage_limit_reached' } } })), 'quota', 'wrapped envelope');
+  assert.equal(quota(JSON.stringify({ response: { error: { code: 'usage_limit_exceeded' } } })), 'quota', 'failed-response envelope');
+  assert.equal(quota(JSON.stringify({ error: { message: 'You have hit your usage limit. Upgrade to Pro.' } })), 'quota', 'words only');
+  assert.equal(quota(JSON.stringify({ error: { message: 'Rate limit reached for gpt-5.4: 3 requests per minute' } })), 'rate-limit');
+  assert.equal(quota(JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'usage limit' } })), 'rate-limit', 'an explicit non-quota code wins over the words');
+});
