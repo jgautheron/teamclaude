@@ -141,7 +141,7 @@ function classify(windows) {
     const bucket = bucketForMinutes(Number(w.windowMinutes));
     const percent = Number(w.usedPercent);
     if (!bucket || !Number.isFinite(percent)) continue;
-    out[bucket] = {
+    const reading = {
       // Anthropic reports utilization as a 0-1 fraction and the rest of the
       // manager compares against `switchThreshold` in those units, so convert
       // here rather than teaching every consumer about percentages.
@@ -149,6 +149,11 @@ function classify(windows) {
       // Epoch seconds upstream, milliseconds everywhere in this codebase.
       resetAt: resetMs(w),
     };
+    // Ranged classification can file two windows in one bucket (a 1-day and
+    // a 7-day window are both "weekly"). The BINDING one — the higher
+    // utilization, with its own reset — is the reading; an account is held
+    // by whichever of its windows is spent, not by the one parsed last.
+    if (!out[bucket] || reading.utilization > out[bucket].utilization) out[bucket] = reading;
   }
   return out;
 }

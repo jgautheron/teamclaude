@@ -9,7 +9,7 @@ import http from 'node:http';
 import net from 'node:net';
 import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, codexUpgradeTarget } from '../src/server.js';
-import { relayCodexUpgrade } from '../src/codex-ws.js';
+import { relayCodexUpgrade, webSocketRefused, clearWebSocketRefusals } from '../src/codex-ws.js';
 import { FrameDecoder, encodeFrame, closeFrame, parseClose, computeAccept, OPCODE } from '../src/ws-frames.js';
 import { setUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
 import { SessionTracker } from '../src/session-tracker.js';
@@ -649,4 +649,62 @@ test('a WebSocket session is pinned to its account: with distribution on, a thre
     for (const c of open) c.socket?.destroy();
     proxy.closeAllConnections?.(); proxy.close(); up.close();
   }
+});
+
+// ── Findings from the adversarial review ───────────────────────────────────
+
+/** Connect with a frame coalesced into the handshake's `head` bytes. */
+function connectWithHead(port, path, frame) {
+  return new Promise((resolve, reject) => {
+    const socket = net.connect(port, '127.0.0.1', () => {
+      socket.write(Buffer.concat([Buffer.from(`GET ${path} HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: Upgrade\r\nUpgrade: websocket\r\nSec-WebSocket-Version: 13\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n`), frame]));
+    });
+    socket.on('error', reject);
+    let buf = Buffer.alloc(0);
+    const onData = (chunk) => {
+      buf = Buffer.concat([buf, chunk]);
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      socket.off('data', onData);
+      resolve({ status: Number(buf.toString().split(' ')[1]), ...attach(socket, { mask: true, initial: buf.subarray(end + 4) }) });
+    };
+    socket.on('data', onData);
+  });
+}
+
+test('a first frame coalesced with the handshake is served, not a crash: text dials, close ends', async () => {
+  const ended = [];
+  await withProxy({ 't-a': { ws: serve(7) } }, async ({ client, hits, port }) => {
+    const c = await connectWithHead(port, RESPONSES, encodeFrame(OPCODE.TEXT, create('gpt-5.4'), { mask: true }));
+    assert.equal(c.status, 101);
+    assert.equal(JSON.parse(await c.text()).type, 'codex.rate_limits');
+    assert.equal(hits.length, 1);
+    c.socket.destroy();
+    const closer = await connectWithHead(port, RESPONSES, closeFrame(1000, 'bye', { mask: true }));
+    assert.equal(closer.status, 101);
+    await new Promise(r => setTimeout(r, 50));
+    assert.equal(hits.length, 1, 'a close in the head never dials');
+    // The proxy is still serving: a normal connection after both works.
+    const again = await client();
+    again.send(create('gpt-5.4'));
+    assert.equal(JSON.parse(await again.text()).type, 'codex.rate_limits');
+  }, { accounts: [codex('a')], hooks: { onRequestEnd: (id, info) => ended.push(info) } });
+  assert.ok(ended.length >= 2);
+});
+
+test('an upstream 426 closes this connection and refuses the next upgrade with an HTTP 426 before any 101', async () => {
+  clearWebSocketRefusals();
+  await withProxy({ 't-a': { status: 426, body: { error: { message: 'websockets disabled' } } } }, async ({ client, hits }) => {
+    const c = await client();
+    c.send(create('gpt-5.4'));
+    const close = await c.closed();
+    assert.equal(close.code, 1011);
+    assert.match(close.reason, /426/);
+    assert.equal(hits.length, 1);
+    const next = await client();
+    assert.equal(next.status, 426, 'the refusal is remembered and answered honestly');
+    assert.equal(hits.length, 1, 'no dial once the upstream is known to refuse');
+  }, { accounts: [codex('a')] });
+  clearWebSocketRefusals();
+  assert.equal(webSocketRefused('127.0.0.1'), false);
 });

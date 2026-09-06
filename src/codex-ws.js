@@ -81,6 +81,30 @@ const TERMINAL_EVENTS = new Set(['response.completed', 'response.failed', 'respo
 
 let upgradeCounter = 0;
 
+// Upstream hosts that answered a WebSocket handshake with 426, and until
+// when to believe it. The relay answers the client's 101 before it dials, so
+// a 426 met upstream can only reach THIS connection as a close — Codex then
+// finishes the turn over SSE — but the next upgrade from any client can be
+// refused with an honest HTTP 426 before anything is committed, which is the
+// status Codex's transport fallback keys on.
+const WS_REFUSED_TTL_MS = 10 * 60 * 1000;
+const wsRefusedUntil = new Map();
+
+export function noteWebSocketRefused(host, ttlMs = WS_REFUSED_TTL_MS, now = Date.now()) {
+  wsRefusedUntil.set(host, now + ttlMs);
+}
+
+/** Whether `host` refused WebSockets recently; expired entries are dropped. */
+export function webSocketRefused(host, now = Date.now()) {
+  const until = wsRefusedUntil.get(host);
+  if (until == null) return false;
+  if (now >= until) { wsRefusedUntil.delete(host); return false; }
+  return true;
+}
+
+/** Test seam. */
+export function clearWebSocketRefusals() { wsRefusedUntil.clear(); }
+
 /** A fresh activity-row id for a WebSocket session. Strings, so they can
  * never collide with the request listener's numeric ids in the TUI's map. */
 export function nextUpgradeId() {
@@ -154,6 +178,10 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
     holdBudgetMs,
     holdTimer: null,
   };
+  // Declared before anything that can run finish() or startDial(): the
+  // upgrade's `head` bytes are fed to the decoder below, and a client that
+  // coalesces its first frame with the handshake reaches both from there.
+  let firstFrameTimer = null;
 
   const finish = (code, reason, status) => {
     if (state.closed) return;
@@ -227,9 +255,12 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
   socket.on('error', () => finish(null, '', state.connected ? 200 : 499));
   if (head?.length) onClientData(head);
 
-  // A client that connects and stays silent is dialed without a model.
-  const firstFrameTimer = setTimeout(() => startDial(), firstFrameTimeoutMs);
-  firstFrameTimer.unref?.();
+  // A client that connects and stays silent is dialed without a model. Not
+  // armed when the head already settled it (dialing, or closed).
+  if (!state.dialing && !state.closed) {
+    firstFrameTimer = setTimeout(() => startDial(), firstFrameTimeoutMs);
+    firstFrameTimer.unref?.();
+  }
 
   // ── upstream side ────────────────────────────────────────────────────────
 
@@ -349,7 +380,7 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
         ures.on('end', async () => {
           done();
           try {
-            await onRefused(account, ures.statusCode, ures.headers, Buffer.concat(chunks).toString('utf8'));
+            await onRefused(account, ures.statusCode, ures.headers, Buffer.concat(chunks).toString('utf8'), target.hostname);
           } catch (err) {
             log(`[TeamClaude] Codex WebSocket relay failed: ${err?.message || err}`);
             finish(1011, 'relay failure', 502);
@@ -370,7 +401,7 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
   }
 
   /** The upstream refused the handshake with an ordinary HTTP response. */
-  async function onRefused(account, status, headers, bodyText) {
+  async function onRefused(account, status, headers, bodyText, host) {
     if (state.closed) return;
     const cls = classifyCodexRejection({ status, headers, body: bodyText });
     const quotaHeaders = {};
@@ -412,8 +443,18 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
       state.endStatus = 429;
       return finish(1013, `teamclaude: rate limited; retry in ${wait}s`, 429);
     }
-    // A 426 means this upstream wants HTTP; anything else is an upstream
-    // problem. Either way the client is told the status and decides itself.
+    // A 426 means this upstream wants HTTP. This connection can only be
+    // closed (the client already has its 101; Codex falls back to SSE for
+    // the turn on the failure), but the next upgrade is refused with a real
+    // 426 before any 101 — see webSocketRefused.
+    if (status === 426) {
+      noteWebSocketRefused(host);
+      log(`[TeamClaude] Upstream 426 on Codex WebSocket handshake for "${account.name}" — refusing WebSockets for ${Math.round(WS_REFUSED_TTL_MS / 60000)} min so clients take SSE`);
+      finish(1011, 'teamclaude: upstream 426; use HTTP', 426);
+      return;
+    }
+    // Anything else is an upstream problem; the client is told the status
+    // and decides itself.
     log(`[TeamClaude] Upstream ${status} on Codex WebSocket handshake for "${account.name}"`);
     finish(1011, `teamclaude: upstream ${status}`, status);
   }

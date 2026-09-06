@@ -281,3 +281,25 @@ test('a wrapped or code-less quota refusal is still a spent quota, and a plain r
   assert.equal(quota(JSON.stringify({ error: { message: 'Rate limit reached for gpt-5.4: 3 requests per minute' } })), 'rate-limit');
   assert.equal(quota(JSON.stringify({ error: { code: 'rate_limit_exceeded', message: 'usage limit' } })), 'rate-limit', 'an explicit non-quota code wins over the words');
 });
+
+test('two windows filed in one bucket keep the binding reading, not the last parsed', () => {
+  // A spent 1-day window next to a healthy 7-day one: both are "weekly".
+  const q = parseCodexQuota({
+    'x-codex-primary-used-percent': '100', 'x-codex-primary-window-minutes': '1440', 'x-codex-primary-reset-at': '2000000000',
+    'x-codex-secondary-used-percent': '10', 'x-codex-secondary-window-minutes': '10080', 'x-codex-secondary-reset-at': '2000600000',
+  });
+  assert.equal(q.unified7d, 1, 'the spent window governs');
+  assert.equal(q.unified7dReset, 2000000000 * 1000, 'with its own reset');
+  // Order does not matter.
+  const r = parseCodexQuota({
+    'x-codex-primary-used-percent': '10', 'x-codex-primary-window-minutes': '10080',
+    'x-codex-secondary-used-percent': '100', 'x-codex-secondary-window-minutes': '1440',
+  });
+  assert.equal(r.unified7d, 1);
+  // Two sub-day windows likewise.
+  const s = parseCodexQuota({
+    'x-codex-primary-used-percent': '30', 'x-codex-primary-window-minutes': '180',
+    'x-codex-secondary-used-percent': '95', 'x-codex-secondary-window-minutes': '300',
+  });
+  assert.equal(s.unified5h, 0.95);
+});

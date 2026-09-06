@@ -73,6 +73,13 @@ TeamClaude relays that connection rather than splicing it blind:
   rate limit closes the client with `1013` and the `retry-after` in the reason,
   so Codex's own retry comes back; anything else closes with `1011` naming the
   upstream status.
+- An upstream **`426`** means that host does not speak WebSockets (a corporate
+  gateway, a future API change). Codex answers a close by retrying the
+  WebSocket several times before it gives up, so the relay remembers the
+  refusal per upstream host for **10 minutes** and answers later upgrades with
+  a plain HTTP `426` itself; Codex then takes `POST` + SSE at once. Verified
+  live: the first launch cost one refused dial, the second never opened a
+  WebSocket.
 - An account that becomes **ineligible mid-connection** — a `usage_limit_reached`
   error event, or a `codex.rate_limits` reading over the switch threshold — is
   never swapped under a response in flight (`previous_response_id` binds the
