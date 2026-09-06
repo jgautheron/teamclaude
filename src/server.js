@@ -12,6 +12,7 @@ import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath } from './provider.js';
+import { classifyCodexRejection } from './codex-quota.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -25,6 +26,13 @@ export const HOP_BY_HOP_HEADERS = new Set([
 ]);
 // Path prefix for the deprecated URL-based account pin (superseded by TC_ACCT).
 const PIN_PREFIX = '/tc-acct/';
+
+// How long a Codex account is held after a quota refusal that states no
+// retry-after. Codex resets are announced on the next successful response,
+// not on the refusal, so this is a revalidation interval rather than a guess
+// at the window: long enough that a spent account is not hammered, short
+// enough that a 5-hour window that rolled over is picked up promptly.
+const CODEX_QUOTA_HOLD_SECONDS = 15 * 60;
 const INLINE_RETRY_AFTER_MAX_SECONDS = 15;
 // How long the proxy will absorb a rate-limit 429's retry-after inline (waiting
 // on the SAME account) before surfacing a 429 + retry-after to the client. A
@@ -44,6 +52,24 @@ export function isOAuthEntitlementDenied(body) {
   } catch {
     return false;
   }
+}
+
+/**
+ * The session a request belongs to, for session-aware routing and the activity
+ * stream. Claude Code tags each session's requests with
+ * `x-claude-code-session-id`. Codex tags its with `session_id` (and the
+ * hyphenated spelling on the WebSocket handshake); it also sends
+ * `x-codex-parent-thread-id`, which is deliberately NOT used here — sibling
+ * sub-agents share a parent, and folding them into one session would
+ * undercount load and pin every sibling to one account. Codex ids are
+ * namespaced so the two clients can never collide on a shared proxy.
+ */
+export function sessionIdOf(req) {
+  const claude = req.headers['x-claude-code-session-id'];
+  if (claude) return String(claude);
+  if (providerForPath(req.url) !== 'codex') return null;
+  const codex = req.headers['session_id'] || req.headers['session-id'];
+  return codex ? `codex:${safeLine(String(codex)).slice(0, 128)}` : null;
 }
 
 // Error payloads are normally tiny, but an alternate upstream is configurable.
@@ -636,7 +662,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
           // value on the path that can carry raw control bytes.
           const shown = safeLine(token ?? raw);
           const reqId = ++counter;
-          const sessionId = req.headers['x-claude-code-session-id'] || null;
+          const sessionId = sessionIdOf(req);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${shown}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${shown}"` } }));
@@ -655,7 +681,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         pinnedIndex = resolveAccountPin(accountManager, forcedPin);
         if (pinnedIndex == null) {
           const reqId = ++counter;
-          const sessionId = req.headers['x-claude-code-session-id'] || null;
+          const sessionId = sessionIdOf(req);
           if (!hideActivity) hooks.onRequestEnd?.(reqId, { method: req.method, path: req.url, account: `(unknown pin: "${safeLine(forcedPin)}")`, status: 404, model: null, sessionId, pinned: false });
           res.writeHead(404, { 'Content-Type': 'application/json' });
           res.end(JSON.stringify({ type: 'error', error: { type: 'not_found_error', message: `Unknown account pin "${forcedPin}" (from TC_ACCT)` } }));
@@ -667,7 +693,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // Claude Code tags each session's requests with this header (present on
       // /v1/messages and count_tokens). Read from headers up front so it drives
       // session-aware routing (issue #109) and colors the TUI activity stream.
-      const sessionId = req.headers['x-claude-code-session-id'] || null;
+      const sessionId = sessionIdOf(req);
       if (!hideActivity) {
         // Marked open BEFORE the hook runs. The shipped TUI hook registers its
         // row and then renders, and the render can rethrow, so a hook that
@@ -1611,8 +1637,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
 
     // Extract rate limit headers
     const rateLimitHeaders = {};
+    // Codex spells its limits `x-codex-*`; updateQuota reads whichever set the
+    // account's provider produces and ignores the other, so both are collected.
     for (const [key, value] of upstreamRes.headers.entries()) {
-      if (key.startsWith('anthropic-ratelimit-')) {
+      if (key.startsWith('anthropic-ratelimit-') || key.startsWith('x-codex-')) {
         rateLimitHeaders[key] = value;
       }
     }
@@ -1626,6 +1654,60 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // Two kinds of 429 are handled differently below: a quota rejection rotates
     // to another account; a transient rate-limit throttle pauses + retries the
     // same account (never rotates — see #84).
+    // A Codex refusal is classified from the response rather than from the
+    // Anthropic `unified-*-status` headers below, which it never carries.
+    //
+    //   - `quota` (a spent window, or a 402 for depleted credits): durable, so
+    //     hold the account for its reset and move the request on. When the
+    //     spent window is a model-scoped bucket the headers already recorded,
+    //     only that model is barred and the account keeps serving the rest —
+    //     the same rule as a Fable-only rejection.
+    //   - `rate-limit`: the per-minute throttle, handled by the shared 429
+    //     path below (pause, one hop, inline wait) — never a rotation.
+    //
+    // A 403 naming a model or workspace entitlement is recognised in the
+    // shared 403 branch further down, which already reads the body.
+    if (account.provider === 'codex' && (upstreamRes.status === 429 || upstreamRes.status === 402)) {
+      const bodyBuf = await readErrorBody(upstreamRes.body);
+      const bodyText = bodyBuf ? Buffer.from(bodyBuf).toString('utf8') : null;
+      const cls = classifyCodexRejection({
+        status: upstreamRes.status,
+        headers: { ...rateLimitHeaders, 'retry-after': upstreamRes.headers.get('retry-after') },
+        body: bodyText,
+      });
+      if (cls.kind === 'quota' && retryCount < maxRetries) {
+        const modelOnly = ctx.model && accountManager.modelBucketSpent(account.index, ctx.model);
+        if (modelOnly) {
+          console.log(`[TeamClaude] ${modelOnly} weekly exhausted on "${account.name}" — switching account for this request`);
+        } else {
+          // No reset is stated on many of these, so a spent reading without a
+          // window is held for a bounded revalidation interval rather than
+          // forever: the next probe or the headers on the retry correct it.
+          const hold = Math.min(Math.max(cls.retryAfter ?? CODEX_QUOTA_HOLD_SECONDS, 1), 3600);
+          console.log(`[TeamClaude] Codex quota exhausted (${upstreamRes.status}${cls.reachedType ? ' ' + cls.reachedType : ''}${cls.code ? ' ' + cls.code : ''}) on "${account.name}" — throttling ${hold}s and switching account`);
+          accountManager.markRateLimited(account.index, hold);
+        }
+        ctx.tried.add(account.index);
+        if (clientGone(res)) return;
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+      if (upstreamRes.status === 402) {
+        // Every 402 classifies as quota, so this is only reachable when the
+        // retry budget is spent: relay it as the error it is. The body was
+        // consumed for classification, so write it back verbatim.
+        logRequestHead();
+        ctx.status = 402;
+        if (!res.headersSent && !clientGone(res)) {
+          res.writeHead(402, { 'Content-Type': upstreamRes.headers.get('content-type') || 'application/json' });
+          res.end(bodyText ?? '');
+        }
+        return;
+      }
+      // A rate-limit 429 continues into the shared 429 path with its body
+      // already consumed.
+      ctx.codexBodyConsumed = true;
+    }
+
     if (upstreamRes.status === 429) {
       // Clamp Retry-After to a sane window: missing/invalid falls back to 60s,
       // and out-of-range values are bounded to [1, 300]. A negative value would
@@ -1634,7 +1716,8 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       let retryAfter = parseInt(upstreamRes.headers.get('retry-after'), 10);
       if (Number.isNaN(retryAfter)) retryAfter = 60;
       // Discard the 429 response body
-      await upstreamRes.body?.cancel();
+      if (!ctx.codexBodyConsumed) await upstreamRes.body?.cancel();
+      ctx.codexBodyConsumed = false;
 
       // Durable quota exhaustion vs. a transient rate limit. A "rejected" unified
       // status means a quota bucket is spent, so waiting and retrying the SAME
@@ -1799,9 +1882,15 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // account left, the no-account branch reports a proxy error instead.
     if (upstreamRes.status === 403 && !res.headersSent) {
       const responseBody = await readErrorBody(upstreamRes.body);
+      // Anthropic names an OAuth policy denial in `error.details.error_code`;
+      // Codex names a model or workspace entitlement in the error code itself.
+      // Both mean "this account cannot serve this, others may", so both cool
+      // the account down rather than merely skipping it for this request.
       const entitlementDenied = account.type === 'oauth'
         && responseBody != null
-        && isOAuthEntitlementDenied(responseBody);
+        && (isOAuthEntitlementDenied(responseBody)
+          || (account.provider === 'codex'
+            && classifyCodexRejection({ status: 403, body: Buffer.from(responseBody).toString('utf8') }).kind === 'entitlement'));
       const deniedUntil = entitlementDenied
         ? accountManager.markEntitlementDenied(account.index)
         : null;

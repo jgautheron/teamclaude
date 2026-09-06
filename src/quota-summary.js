@@ -20,7 +20,7 @@ export function quotaTier(account) {
   return { rateLimitTier, seatTier, weight };
 }
 
-const BUCKETS = ['fiveHour', 'weeklyShared', 'weeklySonnet', 'weeklyFable'];
+const BUCKETS = ['fiveHour', 'weeklyShared', 'weeklySonnet', 'weeklyFable', 'monthly'];
 
 function clean(value) {
   return Math.round(value * 1e12) / 1e12;
@@ -60,6 +60,14 @@ function accountBuckets(quota) {
       quota.unified7dFable != null ? 'unified7dFable' : 'unified7d',
     ),
   };
+  // Codex: the 30-day window a Go/Free plan meters, and the model-scoped
+  // weekly buckets keyed the way a threshold table names them (`codex:<slug>`).
+  const monthly = bucket(quota.unified30d, quota.unified30dReset, 'unified30d');
+  if (monthly) buckets.monthly = monthly;
+  for (const [slug, b] of Object.entries(quota.codexModelBuckets || {})) {
+    const value = b && bucket(b.utilization, b.resetAt, `codex:${slug}`);
+    if (value) buckets[`codex:${slug}`] = { ...value, name: b.name || slug };
+  }
   const tokens = standardBucket(quota.tokensLimit, quota.tokensRemaining, quota.resetsAt, 'tokens');
   const requests = standardBucket(quota.requestsLimit, quota.requestsRemaining, quota.resetsAt, 'requests');
   if (tokens) buckets.tokens = tokens;

@@ -1,5 +1,5 @@
 import { formatMoney } from './oauth.js';
-import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage } from './model.js';
+import { findFamilyBlock, modelGlobOverlaps, gatingUtilization, resolveMaxUsage, codexBucketEntries, codexGatingUtilization } from './model.js';
 import { safeLine } from './safe-text.js';
 
 const ESC = '\x1b[';
@@ -268,7 +268,8 @@ function formatAccountStatus(account, now, paint) {
 // refused, in one render.
 function modelRoutingLine(account, threshold, blocked, now, paint) {
   const q = account.quota || {};
-  if (q.unified7dSonnet == null && q.unified7dFable == null) return null;
+  const codexEntries = codexBucketEntries(q);
+  if (q.unified7dSonnet == null && q.unified7dFable == null && !codexEntries.length) return null;
   const t = Number(threshold);
   const overThreshold = v => v != null && !Number.isNaN(t) && v >= t;
   // A per-account cap is the other ceiling a family can be over. Without it a
@@ -335,9 +336,25 @@ function modelRoutingLine(account, threshold, blocked, now, paint) {
     return `${label} ${mark}${when}`;
   };
 
-  const cells = [cell('Opus', 'unified7d', q.unified7dReset)];
+  // A Codex family: gated by the higher of its bucket and the shared weekly,
+  // capped on its own spend, the same two ceilings the cell above reads.
+  const codexCell = (entry) => {
+    if (findFamilyBlock(blocked, entry.name)) {
+      return `${entry.name} ${paint.red('⊘')}${paint.dim(' blocked')}`;
+    }
+    const gating = codexGatingUtilization(q, entry);
+    const over = overThreshold(gating) || overCap(entry.utilization, entry.key);
+    const mark = sharedOver || over ? paint.red('✗') : paint.green('✓');
+    const resetTs = parseTs(entry.resetAt);
+    const when = over && resetTs && resetTs > now ? paint.dim(` ${formatDuration(resetTs - now)}`) : '';
+    return `${entry.name} ${mark}${when}`;
+  };
+
+  const cells = [];
+  if (account.provider !== 'codex') cells.push(cell('Opus', 'unified7d', q.unified7dReset));
   if (q.unified7dSonnet != null) cells.push(cell('Sonnet', 'unified7dSonnet', q.unified7dSonnetReset));
   if (q.unified7dFable != null) cells.push(cell('Fable', 'unified7dFable', q.unified7dFableReset));
+  for (const entry of codexEntries) cells.push(codexCell(entry));
   return `${paint.dim('Models'.padEnd(8))} ${cells.join('   ')}`;
 }
 
@@ -349,14 +366,26 @@ function quotaLines(account, now, paint) {
   // budget is visible before it binds rather than only as a Blocked line after.
   const cap = bucket => resolveMaxUsage(account.maxUsage, bucket);
 
-  if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null) {
+  const codexEntries = codexBucketEntries(quota);
+  if (quota.unified5h != null || quota.unified7d != null || quota.unified7dSonnet != null || quota.unified7dFable != null
+      || quota.unified30d != null || codexEntries.length) {
     lines.push(formatQuotaLine('Session', quota.unified5h, quota.unified5hReset, now, paint, cap('unified5h')));
-    lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    // A plan that meters only a month has no weekly to show; one that meters
+    // both shows both, since either can be the one that binds.
+    if (quota.unified7d != null || quota.unified30d == null) {
+      lines.push(formatQuotaLine('Weekly', quota.unified7d, quota.unified7dReset, now, paint, cap('unified7d')));
+    }
+    if (quota.unified30d != null) {
+      lines.push(formatQuotaLine('Monthly', quota.unified30d, quota.unified30dReset, now, paint, cap('unified30d')));
+    }
     if (quota.unified7dSonnet != null) {
       lines.push(formatQuotaLine('Sonnet', quota.unified7dSonnet, quota.unified7dSonnetReset, now, paint, cap('unified7dSonnet')));
     }
     if (quota.unified7dFable != null) {
       lines.push(formatQuotaLine('Fable', quota.unified7dFable, quota.unified7dFableReset, now, paint, cap('unified7dFable')));
+    }
+    for (const entry of codexEntries) {
+      lines.push(formatQuotaLine(entry.name, entry.utilization, entry.resetAt, now, paint, cap(entry.key)));
     }
     return lines;
   }

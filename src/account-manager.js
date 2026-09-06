@@ -35,7 +35,16 @@ const PERSISTED_QUOTA_FIELDS = [
   'unifiedStatus', 'unifiedStatusSeenAt',
   'tokensLimit', 'tokensRemaining', 'requestsLimit', 'requestsRemaining', 'resetsAt',
   'scopedWeekly',
+  // Codex: the monthly window (the only window a Go/Free plan meters), the
+  // model-scoped weekly buckets keyed by their header slug, and the plan.
+  'unified30d', 'unified30dReset', 'codexModelBuckets', 'planType',
 ];
+
+// A spent Codex model-scoped bucket is trusted for this long before it is
+// dropped and revalidated, for the same reason the Anthropic family buckets
+// are (see _clearExpiredQuotas): the bucket rides only on responses for that
+// model, and selection stops sending the model once it reads spent.
+const CODEX_BUCKET_PREFIX = 'codex:';
 
 // The family (Fable/Sonnet) weekly buckets and the field holding when each was
 // last confirmed by upstream. See _clearExpiredQuotas: a SPENT family reading is
@@ -74,6 +83,15 @@ function emptyQuota() {
     // Upstream owns this list and it changes, so it is learned rather than
     // declared — a family with no dedicated field above is still metered.
     scopedWeekly: {},
+    // Codex. The 30-day window is the only one a Go/Free plan reports, so it
+    // gates like the weekly does. Model-scoped weekly buckets are keyed by the
+    // header slug (`bengalfox`) and carry the display name upstream gave them
+    // (`GPT-5.3-Codex-Spark`), which is what a request's model id is matched
+    // against: { bengalfox: { name, utilization, resetAt, seenAt } }.
+    unified30d: null,
+    unified30dReset: null,
+    codexModelBuckets: {},
+    planType: null,
     // Paid-overage state from the usage probe: null until a probe reports it.
     // Not a quota — it says whether exceeding the quotas above costs money
     // on this account rather than stopping it.
@@ -352,6 +370,17 @@ export class AccountManager {
     // preference and a cap is a total.
     const capWeekly = this.capFor('unified7d', account);
     if (capWeekly != null && q.unified7d != null && q.unified7d >= capWeekly) return 'unified7d';
+
+    // The monthly window is shared too, on the plans that meter one.
+    const capMonthly = this.capFor('unified30d', account);
+    if (capMonthly != null && q.unified30d != null && q.unified30d >= capMonthly) return 'unified30d';
+
+    // A Codex model-scoped bucket caps only its own model, like a family bucket.
+    const codexBucket = this._codexBucket(account, model);
+    if (codexBucket) {
+      const codexCap = this.capFor(codexBucket.key, account);
+      if (codexCap != null && codexBucket.utilization != null && codexBucket.utilization >= codexCap) return codexBucket.key;
+    }
 
     // …and on top of it, the family bucket that meters THIS model, when the
     // family has one. A Fable cap stops Fable and leaves Opus alone.
@@ -840,7 +869,8 @@ export class AccountManager {
   _governingWeeklyReset(account, model) {
     const q = account.quota;
     const key = this._weeklyBucketFor(model);
-    return q[`${key}Reset`] || this._scopedWeekly(account, model)?.resetAt || q.unified7dReset || null;
+    return q[`${key}Reset`] || this._scopedWeekly(account, model)?.resetAt
+      || this._codexBucket(account, model)?.resetAt || q.unified7dReset || q.unified30dReset || null;
   }
 
   /** True when the family-specific weekly bucket that governs `model` is spent.
@@ -866,9 +896,50 @@ export class AccountManager {
    * whether one was missed: it was not. */
   _modelWeeklyExhausted(account, model) {
     const q = account.quota;
+    const codexBucket = this._codexBucket(account, model);
+    if (codexBucket) return codexBucket.utilization != null && codexBucket.utilization >= this.thresholdFor(codexBucket.key);
     const key = this._weeklyBucketFor(model);
     if (key === 'unified7d') return false;
     return q[key] != null && q[key] >= this.thresholdFor(key);
+  }
+
+  /** The display name of the Codex model-scoped bucket that meters `model` on
+   * this account when that bucket alone is spent (its shared windows still have
+   * headroom), else null. The request path uses it to tell "this model is done
+   * here" from "this account is done", which decide different holds. */
+  modelBucketSpent(index, model) {
+    const account = this.accounts[index];
+    if (!account) return null;
+    const bucket = this._codexBucket(account, model);
+    if (!bucket || bucket.utilization == null || bucket.utilization < this.thresholdFor(bucket.key)) return null;
+    const q = account.quota;
+    const sharedSpent = (q.unified5h != null && q.unified5h >= this.thresholdFor('unified5h'))
+      || (q.unified7d != null && q.unified7d >= this.thresholdFor('unified7d'))
+      || (q.unified30d != null && q.unified30d >= this.thresholdFor('unified30d'));
+    return sharedSpent ? null : (bucket.name || bucket.slug);
+  }
+
+  /**
+   * The Codex model-scoped bucket that meters `model` on this account, or null.
+   *
+   * Upstream names a family by its display name (`GPT-5.3-Codex-Spark`) and a
+   * request names its model by id (`gpt-5.3-codex-spark`); the two agree up to
+   * case, so a bucket governs a model whose id equals its name or starts with
+   * it (a dated or suffixed variant of the same family). The threshold and cap
+   * key for such a bucket is `codex:<slug>`, e.g. `codex:bengalfox`, which is
+   * what a `switchThreshold` or `maxUsage` table names it by.
+   */
+  _codexBucket(account, model) {
+    if (!model || account?.provider !== 'codex') return null;
+    const buckets = account.quota?.codexModelBuckets;
+    if (!buckets || typeof buckets !== 'object') return null;
+    const id = String(model).toLowerCase();
+    for (const [slug, b] of Object.entries(buckets)) {
+      if (!b || typeof b !== 'object') continue;
+      const name = String(b.name || slug).toLowerCase();
+      if (id === name || id.startsWith(name)) return { slug, key: CODEX_BUCKET_PREFIX + slug, ...b };
+    }
+    return null;
   }
 
   /**
@@ -1379,6 +1450,29 @@ export class AccountManager {
       q.unified7dFableSeenAt = null;
       changed = true;
     }
+    if (q.unified30d != null && q.unified30dReset && now >= q.unified30dReset) {
+      console.log(`[TeamClaude] Account "${account.name}" monthly quota reset`);
+      q.unified30d = null;
+      q.unified30dReset = null;
+      changed = true;
+    }
+
+    // Codex model-scoped buckets: expire with their own window, and a SPENT
+    // reading is trusted only while fresh, for the reason the family loop
+    // below explains — nothing but a request of that model refreshes it, and
+    // selection has stopped sending those.
+    if (q.codexModelBuckets && typeof q.codexModelBuckets === 'object') {
+      for (const [slug, b] of Object.entries(q.codexModelBuckets)) {
+        if (!b || typeof b !== 'object') { delete q.codexModelBuckets[slug]; changed = true; continue; }
+        if (b.resetAt && now >= b.resetAt) { delete q.codexModelBuckets[slug]; changed = true; continue; }
+        if (b.utilization == null || b.utilization < this.thresholdFor(CODEX_BUCKET_PREFIX + slug)) continue;
+        if (!b.seenAt) { b.seenAt = now; continue; }
+        if (now < b.seenAt + this.familyStaleMs) continue;
+        console.log(`[TeamClaude] Account "${account.name}" ${b.name || slug} weekly reading is stale — revalidating on the next ${b.name || slug} request`);
+        delete q.codexModelBuckets[slug];
+        changed = true;
+      }
+    }
 
     // A family bucket is refreshed ONLY by upstream evidence for that family:
     // the `7d_oi` headers ride on Fable responses (they are absent from every
@@ -1532,6 +1626,14 @@ export class AccountManager {
     const weeklyVal = this._governingWeekly(account, model);
     if (weeklyVal != null && weeklyVal >= this.thresholdFor(this._weeklyBucketFor(model))) return true;
 
+    // Codex. The monthly window is shared like the weekly one, and on a plan
+    // that meters only a month it is the ONLY reading, so it has to gate on its
+    // own rather than ride along with a weekly that is never reported. A
+    // model-scoped bucket bars only its own model, exactly like a family bucket.
+    if (q.unified30d != null && q.unified30d >= this.thresholdFor('unified30d')) return true;
+    const codexBucket = this._codexBucket(account, model);
+    if (codexBucket?.utilization != null && codexBucket.utilization >= this.thresholdFor(codexBucket.key)) return true;
+
     // Standard quotas (API key accounts)
     if (q.tokensLimit != null && q.tokensRemaining != null) {
       const used = 1 - (q.tokensRemaining / q.tokensLimit);
@@ -1665,28 +1767,29 @@ export class AccountManager {
    * Update an account's quota tracking from upstream response headers.
    */
   /**
-   * Apply a Codex response's rate-limit headers.
-   *
-   * Only fields the response actually stated are assigned: a reading that a
-   * given response did not carry must not blank what we already knew, and the
+   * Apply a Codex quota reading, from whichever of the three sources produced
+   * it (response headers, a WebSocket `codex.rate_limits` event, the usage
+   * probe). Only fields the reading actually stated are assigned: a reading
+   * that did not carry a window must not blank what we already knew, and the
    * catalog fetch carries none at all.
    */
-  _updateCodexQuota(account, headers) {
-    const parsed = parseCodexQuota(headers);
-    const plan = parseCodexPlanType(headers);
-    if (plan) account.quota.planType = plan;
+  _applyCodexQuota(account, parsed) {
+    const q = account.quota;
+    if (parsed.planType) q.planType = parsed.planType;
 
-    if (parsed.unified5h != null) account.quota.unified5h = parsed.unified5h;
-    if (parsed.unified7d != null) account.quota.unified7d = parsed.unified7d;
-    if (parsed.unified5hReset != null) account.quota.unified5hReset = parsed.unified5hReset;
-    if (parsed.unified7dReset != null) account.quota.unified7dReset = parsed.unified7dReset;
+    if (parsed.unified5h != null) q.unified5h = parsed.unified5h;
+    if (parsed.unified7d != null) q.unified7d = parsed.unified7d;
+    if (parsed.unified30d != null) q.unified30d = parsed.unified30d;
+    if (parsed.unified5hReset != null) q.unified5hReset = parsed.unified5hReset;
+    if (parsed.unified7dReset != null) q.unified7dReset = parsed.unified7dReset;
+    if (parsed.unified30dReset != null) q.unified30dReset = parsed.unified30dReset;
 
     // A model-scoped weekly bucket is the counterpart of Anthropic's `7d_oi`
     // Fable bucket: it rides only on responses for that model, so stamp when
     // the reading was taken. That timestamp is what lets a spent bucket be
     // revalidated instead of sealing the account out of the family forever.
     for (const bucket of parsed.modelBuckets || []) {
-      (account.quota.codexModelBuckets ??= {})[bucket.slug] = {
+      (q.codexModelBuckets ??= {})[bucket.slug] = {
         name: bucket.name,
         utilization: bucket.utilization,
         resetAt: bucket.resetAt,
@@ -1694,13 +1797,24 @@ export class AccountManager {
       };
     }
 
-    // Same handshake as the Anthropic path: the first response that reveals a
-    // weekly limit ends probing and asks selection to re-evaluate.
-    if (account.probing && account.quota.unified7dReset != null) {
+    // Same handshake as the Anthropic path: the first reading that reveals a
+    // long window ends probing and asks selection to re-evaluate. The monthly
+    // reset counts too, since on a monthly-only plan it is the long window.
+    if (account.probing && (q.unified7dReset != null || q.unified30dReset != null)) {
       account.probing = false;
       account.requalify = true;
       console.log(`[TeamClaude] Learned weekly quota for "${account.name}", re-evaluating selection`);
     }
+  }
+
+  /**
+   * Apply a Codex response's rate-limit headers.
+   */
+  _updateCodexQuota(account, headers) {
+    const parsed = parseCodexQuota(headers);
+    const plan = parseCodexPlanType(headers);
+    if (plan) parsed.planType = plan;
+    this._applyCodexQuota(account, parsed);
 
     account.usage.totalRequests++;
     account.usage.lastUsed = new Date().toISOString();
@@ -1709,6 +1823,19 @@ export class AccountManager {
       const pct = account.quota.unified7d != null ? Math.round(account.quota.unified7d * 100) : null;
       console.log(`[TeamClaude] "${account.name}" near weekly quota${pct == null ? '' : ` (${pct}%)`}`);
     }
+  }
+
+  /**
+   * Apply a Codex usage-probe reading (or a WebSocket rate-limit event, which
+   * has the same shape). The probe is upstream evidence exactly like a response
+   * header, so it refreshes the model buckets' "last confirmed" stamps — the
+   * one way a spent bucket is corrected without spending quota. A failed probe
+   * carries no readings and changes nothing.
+   */
+  applyCodexUsageData(accountIndex, usage) {
+    const account = this.accounts[accountIndex];
+    if (!account || !usage || usage.error) return;
+    this._applyCodexQuota(account, usage);
   }
 
   updateQuota(accountIndex, headers) {

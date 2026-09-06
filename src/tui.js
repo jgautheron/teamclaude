@@ -1,5 +1,5 @@
 import { createWriteStream } from 'node:fs';
-import { gatingUtilization } from './model.js';
+import { gatingUtilization, codexBucketEntries, codexGatingUtilization } from './model.js';
 import { importCredentials, fetchProfile } from './oauth.js';
 import {
   sameIdentity,
@@ -217,6 +217,12 @@ export function blockedFamilies(quota, threshold) {
     // decision, so deriving it a second way here would be a copy that drifts.
     const gating = gatingUtilization(quota, key);
     if (gating != null && gating >= at(key)) out.push(label);
+  }
+  // Codex model buckets read the same way: the family is barred when the
+  // higher of its own bucket and the shared weekly is over its threshold.
+  for (const entry of codexBucketEntries(quota)) {
+    const gating = codexGatingUtilization(quota, entry);
+    if (gating != null && gating >= at(entry.key)) out.push(entry.name);
   }
   return out;
 }
@@ -1343,6 +1349,9 @@ export class TUI {
       const genRoutes = routes.filter(r => routeFamily(r) === null);
       const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
       const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
+      // Codex model buckets get a bar each, fleet-wide, so the column a family
+      // occupies is the same on every row that has it.
+      const codexFams = [...new Set(this.am.accounts.flatMap(a => codexBucketEntries(a.quota).map(e => e.slug)))].sort();
 
       // Bar width. The budget must count every column the widest row actually
       // draws, or the row overruns the terminal and fitLine cuts the tail off —
@@ -1377,8 +1386,9 @@ export class TUI {
       // and the floor below then overrode the budget: two accounts blocked on both
       // families drew 72 columns at W=70, which fitLine silently cut (#234).
       const showBoth = W >= 70 && roomFor(2);
-      const showFamily = showBoth && (anyFable || anySonnet) && roomFor(2 + (anyFable ? 1 : 0) + (anySonnet ? 1 : 0));
-      const nbars = (showBoth ? 2 : 1) + (showFamily ? (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) : 0);
+      const familyBars = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + codexFams.length;
+      const showFamily = showBoth && familyBars > 0 && roomFor(2 + familyBars);
+      const nbars = (showBoth ? 2 : 1) + (showFamily ? familyBars : 0);
       // Backstop for the case no count of bars can fix: when even one bar at
       // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
       // worse than a wide one; a row cut mid-bar loses the reset countdown its
@@ -1406,7 +1416,7 @@ export class TUI {
         sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
       };
       for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW));
+        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW, codexFams));
       }
     }
 
@@ -1459,7 +1469,7 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, codexFams = null) {
     const a = this.am.accounts[idx];
     const isCur = idx === this.am.currentIndex;
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1520,14 +1530,26 @@ export class TUI {
     // Quota ratios — prefer unified (Claude Max), fall back to standard (API key)
     const q = a.quota;
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
+    let k1 = 'tokens', k2 = 'requests';
 
-    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null) {
+    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null || q.unified30d != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
       t2 = q.unified7dReset;
       w1 = FIVE_HOUR_MS;
       w2 = SEVEN_DAY_MS;
+      k1 = 'unified5h';
+      k2 = 'unified7d';
+      // A Codex plan that meters only a 30-day window has no weekly bar to
+      // draw; the month takes that slot rather than leaving it blank.
+      if (r2 == null && q.unified30d != null) {
+        l2 = 'Mo ';
+        r2 = q.unified30d;
+        t2 = q.unified30dReset;
+        w2 = 30 * 24 * 60 * 60 * 1000;
+        k2 = 'unified30d';
+      }
     } else {
       l1 = 'Tok';
       l2 = 'Req';
@@ -1555,8 +1577,8 @@ export class TUI {
       const th = thFor(k);
       return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
     };
-    const th1 = limFor(r1 === q.unified5h ? 'unified5h' : 'tokens');
-    const th2 = limFor(r2 === q.unified7d ? 'unified7d' : 'requests');
+    const th1 = limFor(k1);
+    const th2 = limFor(k2);
 
     let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
     if (showBoth) {
@@ -1569,6 +1591,19 @@ export class TUI {
       // Fable weekly bar — only shown when the usage probe has populated it.
       if (showFamily && q.unified7dFable != null) {
         line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
+      }
+      // Codex model buckets, one bar per family the fleet knows, in a fixed
+      // order so a family sits in the same column on every row. An account
+      // without the family leaves its column blank rather than shifting the
+      // rest.
+      if (showFamily) {
+        const entries = codexBucketEntries(q);
+        for (const slug of codexFams ?? entries.map(e => e.slug)) {
+          const e = entries.find(x => x.slug === slug);
+          line += e
+            ? `  ${e.label} ${bar(e.utilization, bw, e.resetAt, SEVEN_DAY_MS, limFor(e.key))}`
+            : ' '.repeat(6 + bw);
+        }
       }
     }
     // Explicit "disabled for these models" tag (issue #85): a family the account
