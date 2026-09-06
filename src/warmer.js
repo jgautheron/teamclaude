@@ -20,6 +20,8 @@
 
 import { spawn } from 'node:child_process';
 import { encodePinComponent } from './claude-env.js';
+import { providerOf } from './provider.js';
+import { buildCodexOverrides, codexProviderSettings } from './codex-env.js';
 import {
   ROLLING_NEAR_RESET_TOLERANCE_MS,
   ROLLING_POST_RESET_BUFFER_MS,
@@ -35,6 +37,7 @@ export class Warmer {
     port,
     apiKey = null,
     model = 'haiku',
+    codexModel = null,
     prompt = 'hi',
     spawnFn = defaultSpawn,
     timeoutMs = 120_000,
@@ -49,6 +52,7 @@ export class Warmer {
     this.port = port;
     this.apiKey = apiKey;
     this.model = model;
+    this.codexModel = codexModel;
     this.prompt = prompt;
     this.spawnFn = spawnFn;
     this.timeoutMs = timeoutMs;
@@ -330,6 +334,23 @@ export class Warmer {
     // it is array position, so removing an account would repoint this at a
     // different one. Fall back to the display name when the uuid isn't known
     // yet (e.g. an API-key account, or before the first profile fetch).
+    if (providerOf(account) === 'codex') {
+      // Codex has no `--bare`; `exec` is its one-shot mode. The pin rides in
+      // the provider's base_url and the bootstrap bearer stands in for the
+      // credential, exactly as `teamclaude run --codex` launches it. SSE rather
+      // than WebSocket, so the warm-up is one request row with quota headers.
+      // No `-m` when none is configured: Codex's own default model is the
+      // cheapest choice that is known to exist on the plan.
+      const settings = codexProviderSettings({ port: this.port, account: account.name, websockets: false });
+      return {
+        command: 'codex',
+        args: ['exec', '--skip-git-repo-check', ...(this.codexModel ? ['-m', this.codexModel] : []),
+          ...buildCodexOverrides(settings), this.prompt],
+        env: { ...process.env },
+        timeoutMs: this.timeoutMs,
+        signal,
+      };
+    }
     const pin = encodePinComponent(account.accountUuid || account.name);
     const baseUrl = `http://127.0.0.1:${this.port}/tc-acct/${pin}`;
     return {

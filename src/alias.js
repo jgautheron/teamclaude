@@ -1,4 +1,4 @@
-// `claude` shell alias — print or install/uninstall.
+// `claude` (and `codex`) shell alias — print or install/uninstall.
 //
 // The alias simply routes plain `claude` through `teamclaude run`, which probes
 // the proxy and, when it's down, errors out rather than silently bypassing the
@@ -13,7 +13,16 @@ import { readFileSync, writeFileSync, existsSync, mkdirSync, rmSync, realpathSyn
 import { join, dirname } from 'node:path';
 import { homedir } from 'node:os';
 
-const MARKER = '# teamclaude alias';
+// One marked block per tool, so installing the `codex` alias never touches
+// (or is removed with) the `claude` one.
+const MARKERS = { claude: '# teamclaude alias', codex: '# teamclaude codex alias' };
+
+/** Validate the tool an alias is for; anything else is a programming error. */
+function markerFor(tool) {
+  const marker = MARKERS[tool];
+  if (!marker) throw new Error(`no alias for "${tool}"`);
+  return marker;
+}
 
 /** Basename of the user's login shell, e.g. "zsh". Defaults to bash. */
 export function detectShell() {
@@ -42,11 +51,13 @@ export function teamclaudeRef() {
   return `"${abs}"`;
 }
 
-/** The alias definition for a given shell family. */
-export function aliasLine(shell = detectShell(), ref = teamclaudeRef()) {
-  const body = `${ref} run --`;
-  if (shell === 'fish') return `alias claude '${body}'`;
-  return `alias claude='${body}'`;
+/** The alias definition for a given shell family. `tool` is the command being
+ * aliased: `claude` routes through `run`, `codex` through `run --codex`. */
+export function aliasLine(shell = detectShell(), ref = teamclaudeRef(), tool = 'claude') {
+  markerFor(tool);
+  const body = tool === 'codex' ? `${ref} run --codex --` : `${ref} run --`;
+  if (shell === 'fish') return `alias ${tool} '${body}'`;
+  return `alias ${tool}='${body}'`;
 }
 
 /** The rc file an alias for this shell should live in. */
@@ -64,20 +75,22 @@ export function rcPathForShell(shell = detectShell()) {
   }
 }
 
-export function printAlias({ shell = detectShell() } = {}) {
-  const line = aliasLine(shell);
-  console.log('# Route plain `claude` through the proxy (errors if the proxy is down;');
-  console.log('# append --auto-fallback before `--` to launch claude directly instead).');
+export function printAlias({ shell = detectShell(), tool = 'claude' } = {}) {
+  const line = aliasLine(shell, teamclaudeRef(), tool);
+  const flag = tool === 'codex' ? ' --codex' : '';
+  console.log(`# Route plain \`${tool}\` through the proxy (errors if the proxy is down;`);
+  console.log(`# append --auto-fallback before \`--\` to launch ${tool} directly instead).`);
   console.log('# Add this to your shell config:');
   console.log('');
   console.log(`  ${line}`);
   console.log('');
-  console.log(`# Or install it automatically: teamclaude alias --install`);
+  console.log(`# Or install it automatically: teamclaude alias${flag} --install`);
   console.log(`#   → writes to ${rcPathForShell(shell)} (override with --shell <bash|zsh|fish|sh>)`);
 }
 
-export function installAlias({ shell = detectShell(), rcPath = rcPathForShell(shell) } = {}) {
-  const line = aliasLine(shell);
+export function installAlias({ shell = detectShell(), rcPath = rcPathForShell(shell), tool = 'claude' } = {}) {
+  const line = aliasLine(shell, teamclaudeRef(), tool);
+  const marker = markerFor(tool);
   mkdirSync(dirname(rcPath), { recursive: true });
   let text = existsSync(rcPath) ? readFileSync(rcPath, 'utf8') : '';
 
@@ -86,13 +99,14 @@ export function installAlias({ shell = detectShell(), rcPath = rcPathForShell(sh
     return;
   }
   if (text && !text.endsWith('\n')) text += '\n';
-  text += `${MARKER}\n${line}\n`;
+  text += `${marker}\n${line}\n`;
   writeFileSync(rcPath, text);
   console.log(`Installed alias in ${rcPath}`);
   console.log('Reload your shell (or open a new terminal) to use it.');
 }
 
-export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(shell) } = {}) {
+export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(shell), tool = 'claude' } = {}) {
+  const marker = markerFor(tool);
   if (!existsSync(rcPath)) {
     console.log(`Nothing to remove (${rcPath} does not exist)`);
     return;
@@ -101,7 +115,7 @@ export function uninstallAlias({ shell = detectShell(), rcPath = rcPathForShell(
   // Strip our marked block: the marker comment + the single line after it.
   // Matching by marker (not by exact alias text) makes this robust even if the
   // embedded teamclaude path differs from what's computed now.
-  const blockRe = new RegExp(`\\n?${escapeRe(MARKER)}\\n[^\\n]*\\n?`, 'g');
+  const blockRe = new RegExp(`\\n?${escapeRe(marker)}\\n[^\\n]*\\n?`, 'g');
   let cleaned = text.replace(blockRe, '\n');
   cleaned = cleaned.replace(/\n{3,}/g, '\n\n');
 

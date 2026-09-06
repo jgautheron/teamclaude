@@ -23,6 +23,10 @@ teamclaude server    # start the proxy, shows the TUI
 teamclaude run       # in another terminal: Claude Code through the proxy
 ```
 
+Also on an OpenAI Codex subscription? `teamclaude login --codex` adds it to the
+same pool and `teamclaude run --codex` launches the Codex CLI through the proxy,
+no Codex login needed on the machine — see [docs/accounts.md](docs/accounts.md#codex-accounts-experimental).
+
 Already logged into Claude Code? `teamclaude import` takes its credentials instead of a fresh OAuth round. API keys, and one email holding accounts in several orgs, are covered in [docs/accounts.md](docs/accounts.md).
 
 `teamclaude run` does not require a separate Claude Code login for normal API
@@ -42,6 +46,7 @@ with the selected TeamClaude account credential before forwarding.
 - Holds the request open until quota resets instead of returning 429 when every account is spent, so an unattended run finishes on its own (`holdSeconds`, off by default).
 - Refreshes OAuth tokens before they expire and writes them back to config. Client refreshes pass through untouched.
 - Takes any Anthropic-compatible API (DeepSeek, GLM) as a low-priority fallback for when the Claude accounts are done.
+- Pools OpenAI Codex subscriptions on the same port, with their own rotation, family bars, zero-spend probe, and a per-turn WebSocket relay that picks the account by model.
 - No dependencies. Node built-ins only.
 
 ## Everyday commands
