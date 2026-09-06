@@ -29,6 +29,14 @@ Reacting the wrong way to either one makes things worse, so they are handled sep
 
 Rotating on a rate-limit 429 would just move the burst to the next account and throw away the first account's prompt cache.
 
+### Codex refusals
+
+A Codex account does not send the `unified-*-status` headers, so its refusals are classified from the response itself:
+
+- A **spent window** — a 429 carrying `x-codex-rate-limit-reached-type`, a 429 whose body names `usage_limit_reached`, or a 402 (credits depleted) — is durable. The account is held for the stated `retry-after`, or for 15 minutes when none is given (Codex announces its resets on the next successful response, not on the refusal, so this is a revalidation interval rather than a guess at the window), and the request moves to another account. When the spent window is a model-scoped bucket the headers already recorded, only that model is barred and the account keeps serving the rest, exactly like a Fable-only rejection.
+- A **403 naming a model or workspace entitlement** (`codex_entitlement_missing`, `codex_workspace_access_denied`) cools the account down for five minutes like an OAuth policy denial below, and fails over. Shared quota is untouched.
+- Any **other 429** is the per-minute throttle and takes the rate-limit path: pause, one failover hop, inline wait. Never a rotation.
+
 ## OAuth entitlement denials
 
 A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.
@@ -123,7 +131,7 @@ teamclaude route rm fable
 
 ## Session-aware routing
 
-TeamClaude always tracks running Claude Code sessions by their `x-claude-code-session-id` header — the TUI header and `teamclaude status` show how many are **active** (a request in flight right now, or seen in the last ~2 min) and **known** (seen in the last hour; sessions are forgotten after an hour idle, the maximum prompt-cache extension window). A long streaming request keeps its session active and non-expirable for its whole duration, so a multi-minute completion still counts as load. This is passive: it observes, it doesn't change routing.
+TeamClaude always tracks running Claude Code sessions by their `x-claude-code-session-id` header (a Codex session by its `session_id` header, namespaced `codex:` so the two clients never collide; Codex's `x-codex-parent-thread-id` is deliberately not a session id, since sibling sub-agents share it) — the TUI header and `teamclaude status` show how many are **active** (a request in flight right now, or seen in the last ~2 min) and **known** (seen in the last hour; sessions are forgotten after an hour idle, the maximum prompt-cache extension window). A long streaming request keeps its session active and non-expirable for its whole duration, so a multi-minute completion still counts as load. This is passive: it observes, it doesn't change routing.
 
 Default rotation is purely quota-driven, so many parallel sessions all pile onto the *current* account while equal-priority siblings sit idle — one account queues behind its upstream concurrency ceiling while others do nothing ([#109](https://github.com/KarpelesLab/teamclaude/issues/109)). Enable `distributeSessions` to fix that:
 
