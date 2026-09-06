@@ -10,7 +10,7 @@
 // using the Codex CLI's own client id, so a pooled account stays live the same
 // way an Anthropic one does.
 
-import { readFile, writeFile, rename, chmod } from 'node:fs/promises';
+import { readFile, writeFile, rename, chmod, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
@@ -89,10 +89,16 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
  * `account_id`, `OPENAI_API_KEY`, `auth_mode`) is preserved; `last_refresh`
  * is stamped the way the CLI stamps it. The write is atomic (temp + rename) so
  * a CLI reading concurrently never sees a torn file, and the mode stays 0600.
+ *
+ * Returns `{ written: true }`, or `{ written: false, reason }` when the file no
+ * longer holds what was refreshed (see the guards below); the caller keeps its
+ * in-memory login either way. `beforeReplace` is a test seam, run between the
+ * temp write and the final check.
  */
-export async function writeCodexCredentials(filePath, { accessToken, refreshToken }, { home = homedir(), expectAccountId = null, expectRefreshToken = null } = {}) {
+export async function writeCodexCredentials(filePath, { accessToken, refreshToken }, { home = homedir(), expectAccountId = null, expectRefreshToken = null, beforeReplace = null } = {}) {
   const resolvedPath = filePath.replace(/^~/, home);
-  const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+  const snapshot = await readFile(resolvedPath, 'utf-8');
+  const raw = JSON.parse(snapshot);
   // The file is shared, so it may no longer hold what was refreshed: the CLI
   // may have logged into another account, rotated the pair itself, or
   // switched to an API key (no token pair at all). Either way the file is
@@ -113,6 +119,19 @@ export async function writeCodexCredentials(filePath, { accessToken, refreshToke
   const tmp = `${resolvedPath}.tc-${process.pid}.tmp`;
   await writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
   await chmod(tmp, 0o600);
+  if (beforeReplace) await beforeReplace();
+  // Last look before the swap. The checks above ran on a snapshot, and the
+  // temp write since then is a window in which the CLI can save a new login
+  // that the rename would then bury. The Codex CLI takes no lock on its file
+  // (its own save is a plain truncating write), so this cannot be made
+  // atomic from here; what can be done is to shrink the unguarded window to
+  // the re-read → rename pair, and to abandon the swap when the bytes moved.
+  let latest = null;
+  try { latest = await readFile(resolvedPath, 'utf-8'); } catch { /* removed: not ours to recreate */ }
+  if (latest !== snapshot) {
+    await rm(tmp, { force: true });
+    return { written: false, reason: 'the file changed while the new pair was being written' };
+  }
   await rename(tmp, resolvedPath);
   return { written: true };
 }

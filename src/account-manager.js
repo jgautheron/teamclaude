@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
-import { refreshCodexToken, writeCodexCredentials } from './codex-auth.js';
+import { refreshCodexToken, writeCodexCredentials, importCodexCredentials } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage } from './model.js';
@@ -216,13 +216,14 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, codexWriteBackFn = writeCodexCredentials, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, codexWriteBackFn = writeCodexCredentials, codexReadFn = importCodexCredentials, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
     this._codexWriteBackFn = codexWriteBackFn;
+    this._codexReadFn = codexReadFn;
     this._codexRefreshFn = codexRefreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
@@ -2189,8 +2190,18 @@ export class AccountManager {
     if (account._refreshPromise) return account._refreshPromise;
 
     account._refreshPromise = (async () => {
-      console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
       try {
+        // A Codex importFrom account shares its file with the Codex CLI, which
+        // may have refreshed or logged in again since the file was last read.
+        // OpenAI refresh tokens are single-use, so spending ours after the CLI
+        // rotated it would only earn an invalid_grant and sideline a healthy
+        // login; the file's newer pair is the one to use, and when it is
+        // still fresh there is nothing to refresh at all.
+        if (providerOf(account) === 'codex' && account.importFrom) {
+          const adopted = await this._adoptCodexFileTokens(account);
+          if (adopted && !isTokenExpiringSoon(account.expiresAt)) return;
+        }
+        console.log(`[TeamClaude] Refreshing token for account "${account.name}"...`);
         // Each provider mints tokens at its own endpoint with its own client
         // id, so the grant is dispatched by provider. Both return the same
         // { accessToken, refreshToken, expiresAt } shape, which is what lets
@@ -2243,6 +2254,29 @@ export class AccountManager {
     })();
 
     return account._refreshPromise;
+  }
+
+  /**
+   * Re-read a Codex importFrom file and take over its token pair when it is
+   * newer than ours and still the same login. Returns whether anything changed.
+   * A file that now holds another account is not adopted: the entry's identity
+   * is its account id, and the write-back guard keeps that login untouched.
+   */
+  async _adoptCodexFileTokens(account) {
+    let file;
+    try {
+      file = await this._codexReadFn(account.importFrom);
+    } catch {
+      return false;
+    }
+    if (!file?.accessToken || !file.refreshToken || file.refreshToken === account.refreshToken) return false;
+    if (file.accountId && account.accountId && file.accountId !== account.accountId) return false;
+    account.credential = file.accessToken;
+    account.refreshToken = file.refreshToken;
+    account.expiresAt = file.expiresAt ?? null;
+    account._deadRefreshToken = null;
+    console.log(`[TeamClaude] Adopted the newer Codex token pair from ${account.importFrom} for account "${account.name}"`);
+    return true;
   }
 
   /**
