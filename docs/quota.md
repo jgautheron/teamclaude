@@ -158,4 +158,6 @@ Set it in the config file (`~/.config/teamclaude.json`):
 
 `teamclaude run` automatically raises `API_TIMEOUT_MS` on the spawned Claude Code process to `holdSeconds + 60` seconds, so the client-side timeout covers the full hold window. No manual Claude Code configuration is needed.
 
+The same hold applies to a Codex account pool, over both transports: a `POST` is held like any request, and a [Codex WebSocket](proxy-modes.md#codex-over-websocket) that finds no account with headroom is kept open and re-routed on the same poll instead of being closed. Codex is waiting for its first response event during the hold, so `teamclaude run --codex` raises its `stream_idle_timeout_ms` to `holdSeconds + 60` seconds just as `run` does for Claude Code. A pinned session never holds: the pinned account is either available or refused.
+
 Useful for overnight or unattended runs: rather than waking up to a stopped task, the session resumes silently once a quota window opens.
