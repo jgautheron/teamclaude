@@ -419,11 +419,14 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     if (!isSameOriginControlRequest(req)) { refuseUpgrade(socket, 403, 'cross-origin WebSocket refused'); return; }
     req.url = codex.path;
     // An upstream that refused WebSockets recently gets the client an honest
-    // 426 now, before a 101 is committed, so Codex takes its SSE path.
-    const target = codex.pinnedIndex != null
-      ? accountManager.accounts[codex.pinnedIndex]
-      : accountManager.accounts.find(a => providerOf(a) === 'codex');
-    if (target && webSocketRefused(new URL(upstreamFor(target, upstream)).hostname)) {
+    // 426 now, before a 101 is committed, so Codex takes its SSE path. Only
+    // when every account this upgrade can land on sits behind such a host:
+    // the account is chosen after the 101 (it depends on the model), so the
+    // refusal must hold for all candidates, not just the first one listed.
+    const candidates = codex.pinnedIndex != null
+      ? [accountManager.accounts[codex.pinnedIndex]]
+      : accountManager.accounts.filter(a => providerOf(a) === 'codex');
+    if (candidates.length && candidates.every(a => webSocketRefused(new URL(upstreamFor(a, upstream)).hostname))) {
       refuseUpgrade(socket, 426, 'Upstream refused WebSockets; use HTTP');
       return;
     }

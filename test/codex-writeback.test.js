@@ -126,3 +126,23 @@ test('the manager passes the account id and the refresh token it spent as the wr
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('the write-back refuses a file that lost its token pair, but not one that merely lacks account_id', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-wb-'));
+  try {
+    const path = join(dir, 'auth.json');
+    // `codex login --with-api-key` leaves no tokens at all.
+    await writeFile(path, JSON.stringify({ auth_mode: 'apikey', OPENAI_API_KEY: 'sk-x', tokens: null }), { mode: 0o600 });
+    const refused = await writeCodexCredentials(path, { accessToken: 'at', refreshToken: 'rt' }, { expectAccountId: 'acct-1', expectRefreshToken: 'rt-old' });
+    assert.equal(refused.written, false);
+    assert.match(refused.reason, /no longer holds a token pair/);
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).tokens, null, 'the API-key login is untouched');
+    // The CLI's account_id is optional; its absence is not evidence of another login.
+    await writeFile(path, JSON.stringify({ auth_mode: 'chatgpt', tokens: { access_token: 'a', refresh_token: 'rt-old' } }), { mode: 0o600 });
+    const ok = await writeCodexCredentials(path, { accessToken: 'at', refreshToken: 'rt' }, { expectAccountId: 'acct-1', expectRefreshToken: 'rt-old' });
+    assert.equal(ok.written, true);
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).tokens.refresh_token, 'rt');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
