@@ -1,5 +1,6 @@
 import { createWriteStream } from 'node:fs';
 import { gatingUtilization, codexBucketEntries, codexGatingUtilization } from './model.js';
+import { providerOf } from './provider.js';
 import { importCredentials, fetchProfile } from './oauth.js';
 import {
   sameIdentity,
@@ -182,6 +183,13 @@ const BAR_MAX = 20;
 // when the row has width to spare, but never drops below it, so a narrow
 // terminal lays the table out exactly as it did before the column could grow.
 const NAME_MIN = 12;
+// The Claude | Codex split: the gutter between the panes, and what each pane
+// must fit before the list splits at all — its two shared bars at BAR_MIN.
+const PANE_GUTTER = ' │ ';
+// Bars in a pane cap narrower than in the full-width list: a pane has half
+// the columns, and a name that reads whole is worth more than a bar wider
+// than its reset label needs.
+const PANE_BAR_MAX = 12;
 
 // Families this account can't serve right now: a family whose own weekly bucket
 // is over the switch threshold is barred from that model while the account is
@@ -232,6 +240,11 @@ export function blockedFamilies(quota, threshold) {
  *  can come up one column short; pad that too — the frame is repainted in
  *  place, and a line narrower than the terminal leaves the previous frame's
  *  last cell visible. */
+/** A pane's title line: the name, then a rule out to the pane's edge. */
+function paneTitle(label, w) {
+  return fitLine(` ${bold(label)} ${dim('─'.repeat(Math.max(1, w - vw(label) - 2)))}`, w);
+}
+
 export function fitLine(s, w) {
   const v = vw(s);
   if (v > w) {
@@ -1341,82 +1354,28 @@ export class TUI {
         ? '  The server reports no accounts.'
         : '  No accounts configured. Press [g] → Add account.'));
     } else {
-      lines.push('');
-
-      // Routes drive the inline markers; general (non-family) routes get a stable
-      // column each at the row start so the marker's position identifies the route.
-      const routes = this.am.getRoutes();
-      const genRoutes = routes.filter(r => routeFamily(r) === null);
-      const anyFable = this.am.accounts.some(a => a.quota.unified7dFable != null);
-      const anySonnet = this.am.accounts.some(a => a.quota.unified7dSonnet != null);
-      // Codex model buckets get a bar each, fleet-wide, so the column a family
-      // occupies is the same on every row that has it.
-      const codexFams = [...new Set(this.am.accounts.flatMap(a => codexBucketEntries(a.quota).map(e => e.slug)))].sort();
-
-      // Bar width. The budget must count every column the widest row actually
-      // draws, or the row overruns the terminal and fitLine cuts the tail off —
-      // which is how the S7/F7 bars lost the reset countdown they carry. Three
-      // parts beyond the bars themselves:
-      //   - the fixed prefix (marker, name, type, status, first bar label),
-      //   - the route-marker cells, one per general route,
-      //   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
-      // The `⊘ Sonnet Fable` tag is reserved for only when some account is
-      // actually blocked; the common case where nothing is spends those columns
-      // on the bars instead of leaving the row short of the edge.
-      const tagW = this.am.accounts.reduce((w, a) => {
-        const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
-        return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
-      }, 0);
-      // Same rule for the `$`/`$!` money tag: a column the row can draw is a
-      // column the budget has to know about, or the row overflows exactly the
-      // way #228 fixed.
-      const spendW = this.am.accounts.reduce((w, a) => {
-        const tag = spendTag(a.quota);
-        return tag ? Math.max(w, 2 + vw(tag)) : w;
-      }, 0);
-      const fixed = 28 + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW;
-      const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
-      // The family bars are the first thing to go: below the width where they
-      // fit even at BAR_MIN they would push the row past the edge, and a row cut
-      // mid-bar reads worse than one that simply doesn't draw them (the `⊘` tag
-      // still says which family is barred).
-      // The second shared bar answers to roomFor too, not just to a width
-      // threshold. `W >= 70` alone let the reservations (a 16-column blocked-family
-      // tag on two families, plus route cells) leave less than BAR_MIN per bar,
-      // and the floor below then overrode the budget: two accounts blocked on both
-      // families drew 72 columns at W=70, which fitLine silently cut (#234).
-      const showBoth = W >= 70 && roomFor(2);
-      const familyBars = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + codexFams.length;
-      const showFamily = showBoth && familyBars > 0 && roomFor(2 + familyBars);
-      const nbars = (showBoth ? 2 : 1) + (showFamily ? familyBars : 0);
-      // Backstop for the case no count of bars can fix: when even one bar at
-      // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
-      // worse than a wide one; a row cut mid-bar loses the reset countdown its
-      // tail carries, and does it without saying so.
-      const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
-      const bw = avail < BAR_MIN
-        ? Math.max(1, avail)
-        : Math.min(BAR_MAX, avail);
-
-      // Whatever the chrome and the capped bars leave over goes to the name
-      // column, up to the longest name in the fleet, so a wide terminal shows
-      // whole addresses instead of `a-considerab`. `fixed` already reserves
-      // NAME_MIN, so only the surplus past it is spent here: the row stays
-      // inside the budget above, and a terminal with no surplus keeps the
-      // twelve-column cell it had.
-      const longestName = Math.max(0, ...this.am.accounts.map(a => vw(a.name)));
-      const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
-      const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
-
-      // The single account each secondary bucket currently routes to (null = none
-      // can serve it right now). Marked next to that account's F7/S7 bar — the
-      // secondary-quota analogue of ► marking the default route's current account.
-      const familyTarget = {
-        fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
-        sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
-      };
-      for (let i = 0; i < this.am.accounts.length; i++) {
-        lines.push(this._renderAcct(i, bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW, codexFams));
+      // Two provider pools, two panes: Claude on the left, Codex on the right,
+      // each laid out against half the width, so the list is as tall as the
+      // larger pool rather than both stacked. The pane titles ride in the
+      // spacer line the list has always had, so the split costs no height.
+      // Too narrow for two panes (both shared bars at BAR_MIN in each), and
+      // the list is one column again — Claude first, then Codex, with the
+      // type column naming the provider.
+      const panes = this._accountPanes();
+      const split = panes.claude.length && panes.codex.length ? this._splitLayout(panes, W) : null;
+      if (split) {
+        lines.push(paneTitle('Claude', split.paneW) + dim(PANE_GUTTER) + paneTitle('Codex', split.paneW));
+        const n = Math.max(panes.claude.length, panes.codex.length);
+        for (let r = 0; r < n; r++) {
+          const l = r < panes.claude.length ? this._renderAcctWith(panes.claude[r], split.left) : '';
+          const c = r < panes.codex.length ? this._renderAcctWith(panes.codex[r], split.right) : '';
+          lines.push(fitLine(l, split.paneW) + dim(PANE_GUTTER) + c);
+        }
+      } else {
+        lines.push('');
+        const order = [...panes.claude, ...panes.codex];
+        const layout = this._listLayout(order, W, false);
+        for (const i of order) lines.push(this._renderAcctWith(i, layout));
       }
     }
 
@@ -1469,9 +1428,128 @@ export class TUI {
     this._paint(buf, force);
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, codexFams = null) {
+  /** Account indexes by pool, in config order. */
+  _accountPanes() {
+    const claude = [];
+    const codex = [];
+    this.am.accounts.forEach((a, i) => (providerOf(a) === 'codex' ? codex : claude).push(i));
+    return { claude, codex };
+  }
+
+  /** The two pane layouts when each half of `W` fits a compact row with both
+   * shared bars; null when the list must stay one column. */
+  _splitLayout(panes, W) {
+    const paneW = Math.floor((W - vw(PANE_GUTTER)) / 2);
+    const left = this._listLayout(panes.claude, paneW, true);
+    const right = this._listLayout(panes.codex, paneW, true);
+    if (!left.showBoth || !right.showBoth) return null;
+    return { paneW, left, right };
+  }
+
+  /**
+   * The width budget for one list of accounts drawn `W` columns wide: how many
+   * bars a row draws, how wide, and how wide the name cell is. `compact` drops
+   * the type column, which a pane's title already answers.
+   *
+   * The budget must count every column the widest row actually draws, or the
+   * row overruns the terminal and fitLine cuts the tail off — which is how the
+   * S7/F7 bars lost the reset countdown they carry. Three parts beyond the
+   * bars themselves:
+   *   - the fixed prefix (marker, name, [type], status, first bar label),
+   *   - the route-marker cells, one per general route,
+   *   - 6 columns of label for each bar past the first (`  Wk `, ` ►F7  `).
+   */
+  _listLayout(indices, W, compact) {
+    const accts = indices.map(i => this.am.accounts[i]);
+    // Routes drive the inline markers; general (non-family) routes get a stable
+    // column each at the row start so the marker's position identifies the route.
+    const routes = this.am.getRoutes();
+    const genRoutes = routes.filter(r => routeFamily(r) === null);
+    const anyFable = accts.some(a => a.quota.unified7dFable != null);
+    const anySonnet = accts.some(a => a.quota.unified7dSonnet != null);
+    // Codex model buckets get a bar each, list-wide, so the column a family
+    // occupies is the same on every row that has it.
+    const codexFams = [...new Set(accts.flatMap(a => codexBucketEntries(a.quota).map(e => e.slug)))].sort();
+
+    // The `⊘ Sonnet Fable` tag is reserved for only when some account is
+    // actually blocked; the common case where nothing is spends those columns
+    // on the bars instead of leaving the row short of the edge.
+    const tagW = accts.reduce((w, a) => {
+      const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
+      return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
+    }, 0);
+    // Same rule for the `$`/`$!` money tag: a column the row can draw is a
+    // column the budget has to know about, or the row overflows exactly the
+    // way #228 fixed.
+    const spendW = accts.reduce((w, a) => {
+      const tag = spendTag(a.quota);
+      return tag ? Math.max(w, 2 + vw(tag)) : w;
+    }, 0);
+    const fixed = (compact ? 20 : 28) + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW;
+    const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
+    // The family bars are the first thing to go: below the width where they
+    // fit even at BAR_MIN they would push the row past the edge, and a row cut
+    // mid-bar reads worse than one that simply doesn't draw them (the `⊘` tag
+    // still says which family is barred).
+    // The second shared bar answers to roomFor too, not just to a width
+    // threshold. `W >= 70` alone let the reservations (a 16-column blocked-family
+    // tag on two families, plus route cells) leave less than BAR_MIN per bar,
+    // and the floor below then overrode the budget: two accounts blocked on both
+    // families drew 72 columns at W=70, which fitLine silently cut (#234).
+    const showBoth = W >= (compact ? 62 : 70) && roomFor(2);
+    const familyBars = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + codexFams.length;
+    const showFamily = showBoth && familyBars > 0 && roomFor(2 + familyBars);
+    const nbars = (showBoth ? 2 : 1) + (showFamily ? familyBars : 0);
+    // Backstop for the case no count of bars can fix: when even one bar at
+    // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
+    // worse than a wide one; a row cut mid-bar loses the reset countdown its
+    // tail carries, and does it without saying so.
+    const avail = Math.floor((W - fixed - 6 * (nbars - 1)) / nbars);
+    const bw = avail < BAR_MIN
+      ? Math.max(1, avail)
+      : Math.min(compact ? PANE_BAR_MAX : BAR_MAX, avail);
+
+    // Whatever the chrome and the capped bars leave over goes to the name
+    // column, up to the longest name in the list, so a wide terminal shows
+    // whole addresses instead of `a-considerab`. `fixed` already reserves
+    // NAME_MIN, so only the surplus past it is spent here: the row stays
+    // inside the budget above, and a terminal with no surplus keeps the
+    // twelve-column cell it had.
+    const longestName = Math.max(0, ...accts.map(a => vw(a.name)));
+    const slack = Math.max(0, W - fixed - 6 * (nbars - 1) - nbars * bw);
+    const nameW = Math.max(NAME_MIN, Math.min(longestName, NAME_MIN + slack));
+
+    // The single account each secondary bucket currently routes to (null = none
+    // can serve it right now). Marked next to that account's F7/S7 bar — the
+    // secondary-quota analogue of ► marking the default route's current account.
+    const familyTarget = {
+      fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
+      sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
+    };
+    return { bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW, codexFams, compact };
+  }
+
+  _renderAcctWith(idx, L) {
+    return this._renderAcct(idx, L.bw, L.showBoth, L.routes, L.genRoutes, L.familyTarget, L.showFamily, L.nameW, L.codexFams, { compact: L.compact });
+  }
+
+  /**
+   * Whether ► belongs on this row. The manager keeps one cursor for the fleet,
+   * and rotation is partitioned by provider, so the cursor names the current
+   * account of ONE pool. The other pool's marker goes on the account its next
+   * request would land on — read-only, the same preview the F7/S7 markers use.
+   */
+  _isCurrentAccount(idx) {
+    if (idx === this.am.currentIndex) return true;
+    const cur = this.am.accounts[this.am.currentIndex];
+    const provider = providerOf(this.am.accounts[idx]);
+    if (cur && providerOf(cur) === provider) return false;
+    return this.am.previewProviderIndex?.(provider) === idx;
+  }
+
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, codexFams = null, { compact = false } = {}) {
     const a = this.am.accounts[idx];
-    const isCur = idx === this.am.currentIndex;
+    const isCur = this._isCurrentAccount(idx);
     const isSel = this.mode === 'select' && idx === this.selIdx;
 
     // Prefix: selection marker + current marker
@@ -1511,8 +1589,9 @@ export class TUI {
     const rawName = rpad(truncate(a.name, nameW), nameW);
     const name = isSel ? bold(rawName) : rawName;
 
-    // Type
-    const type = gray(a.type.padEnd(7));
+    // Type: the provider for a Codex account, since `oauth` would not tell it
+    // from a Claude one. Dropped in a pane, whose title already says.
+    const type = compact ? '' : gray((providerOf(a) === 'codex' ? 'codex' : a.type).padEnd(7)) + ' ';
 
     // Status — a disabled account is shown as such regardless of its quota state.
     let status;
@@ -1580,7 +1659,7 @@ export class TUI {
     const th1 = limFor(k1);
     const th2 = limFor(k2);
 
-    let line = ` ${sel}${cur} ${startSlot}${name} ${type} ${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
+    let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
     if (showBoth) {
       line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
