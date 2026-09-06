@@ -61,10 +61,13 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
 
   const claims = decodeJwtClaims(tokens.id_token) || {};
   const auth = claims['https://api.openai.com/auth'] || {};
+  // auth.json stores no expiry; the access token's own `exp` claim is it.
+  const exp = Number(decodeJwtClaims(tokens.access_token)?.exp);
 
   return {
     accessToken: tokens.access_token,
     refreshToken: tokens.refresh_token,
+    expiresAt: Number.isFinite(exp) && exp > 0 ? exp * 1000 : undefined,
     // Scopes the token to one ChatGPT account. Prefer the id_token claim and
     // fall back to the stored value: they agree in practice, but the claim is
     // the one the server itself issued.
