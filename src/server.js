@@ -11,9 +11,9 @@ import { parseRequestModel, parseAdvisorModel } from './account-manager.js';
 import { TopLevelFieldFinder, modelGlobMatches } from './model.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath } from './provider.js';
+import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath, providerOf } from './provider.js';
 import { classifyCodexRejection } from './codex-quota.js';
-import { relayCodexUpgrade, refuseUpgrade, nextUpgradeId } from './codex-ws.js';
+import { relayCodexUpgrade, refuseUpgrade, nextUpgradeId, webSocketRefused } from './codex-ws.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -418,6 +418,15 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     if (!auth.ok && !isLoopbackAddr(req.socket.remoteAddress)) { refuseUpgrade(socket, 401, 'Invalid proxy API key'); return; }
     if (!isSameOriginControlRequest(req)) { refuseUpgrade(socket, 403, 'cross-origin WebSocket refused'); return; }
     req.url = codex.path;
+    // An upstream that refused WebSockets recently gets the client an honest
+    // 426 now, before a 101 is committed, so Codex takes its SSE path.
+    const target = codex.pinnedIndex != null
+      ? accountManager.accounts[codex.pinnedIndex]
+      : accountManager.accounts.find(a => providerOf(a) === 'codex');
+    if (target && webSocketRefused(new URL(upstreamFor(target, upstream)).hostname)) {
+      refuseUpgrade(socket, 426, 'Upstream refused WebSockets; use HTTP');
+      return;
+    }
     relayCodexUpgrade(req, socket, head, {
       accountManager, upstream, sx, sxAgent, hooks, reqId: nextUpgradeId(),
       pinnedIndex: codex.pinnedIndex, sessionId: sessionIdOf(req), client: auth.client,

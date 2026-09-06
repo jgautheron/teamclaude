@@ -2195,6 +2195,7 @@ export class AccountManager {
         // id, so the grant is dispatched by provider. Both return the same
         // { accessToken, refreshToken, expiresAt } shape, which is what lets
         // everything downstream stay provider-agnostic.
+        const spentRefreshToken = account.refreshToken;
         const newTokens = await (providerOf(account) === 'codex'
           ? this._codexRefreshFn(account.refreshToken)
           : this._refreshFn(account.refreshToken));
@@ -2211,7 +2212,10 @@ export class AccountManager {
         // and the next start will all read it.
         if (providerOf(account) === 'codex' && account.importFrom) {
           try {
-            await this._codexWriteBackFn(account.importFrom, newTokens);
+            const result = await this._codexWriteBackFn(account.importFrom, newTokens, { expectAccountId: account.accountId, expectRefreshToken: spentRefreshToken });
+            if (result && result.written === false) {
+              console.error(`[TeamClaude] Not writing the refreshed Codex token to ${account.importFrom}: ${result.reason}. The in-memory login stays valid; re-import to adopt the file's.`);
+            }
           } catch (err) {
             console.error(`[TeamClaude] Could not write the refreshed Codex token back to ${account.importFrom}: ${err.message} — the Codex CLI's copy is now stale; run: codex login`);
           }
