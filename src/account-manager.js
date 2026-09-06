@@ -2345,6 +2345,9 @@ export class AccountManager {
       accounts: this.accounts.map(a => ({
         name: a.name,
         type: a.type,
+        // Renderers key on it: a Codex account has no Opus cell, and its
+        // family bars are its own.
+        provider: providerOf(a),
         orgName: a.orgName || null,
         priority: a.priority || 0,
         disabled: a.disabled || false,

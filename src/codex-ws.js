@@ -39,6 +39,7 @@ import http from 'node:http';
 import https from 'node:https';
 import { parseRequestModel } from './model.js';
 import { applyAuthHeaders, upstreamFor } from './provider.js';
+import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 import { parseCodexRateLimitsEvent, classifyCodexRejection } from './codex-quota.js';
 import { FrameDecoder, computeAccept, handshakeKey, closeFrame, OPCODE } from './ws-frames.js';
 
@@ -267,10 +268,16 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
 
     const target = new URL(`${upstreamFor(account, upstream)}${path}`);
     const transport = target.protocol === 'http:' ? http : https;
-    const useProxy = !!(sx?.useByDefault() && sx.isProvisioned());
-    // Never the default (keep-alive) agent: a refused upgrade leaves a socket
-    // the server has already ended, and a pooled redial would land on it.
-    const agent = useProxy && sxAgent ? sxAgent(sx, target.hostname) : false;
+    const useSx = !!(sx?.useByDefault() && sx.isProvisioned());
+    // The configured upstream proxy is how this host reaches the network at
+    // all (see proxy-modes.md); an sx.org egress, when chosen, wins as it does
+    // for requests. Never the default (keep-alive) agent otherwise: a refused
+    // upgrade leaves a socket the server has already ended, and a pooled
+    // redial would land on it.
+    const corporate = proxyForHost(target.hostname);
+    const agent = useSx && sxAgent ? sxAgent(sx, target.hostname)
+      : corporate ? proxyAgent(corporate, { targetHost: target.hostname, targetPort: Number(target.port) || (target.protocol === 'http:' ? 80 : 443), tls: target.protocol !== 'http:' })
+        : false;
     const expectedAccept = computeAccept(headers['sec-websocket-key']);
 
     await new Promise((resolve) => {

@@ -17,11 +17,14 @@ export async function resolveAccounts(config) {
   const accounts = [];
   for (const acct of config.accounts) {
     if (acct.type === 'oauth') {
-      if (acct.importFrom || providerOf(acct) === 'codex') {
-        // A Codex account defaults to the Codex CLI's own credentials file, so
-        // `{ "name": "...", "type": "oauth", "provider": "codex" }` is enough
-        // to pool an already-signed-in Codex login.
-        const isCodex = providerOf(acct) === 'codex';
+      const isCodex = providerOf(acct) === 'codex';
+      // A Codex account with no credential of its own defaults to the Codex
+      // CLI's credentials file, so `{ "name": "...", "type": "oauth",
+      // "provider": "codex" }` is enough to pool an already-signed-in login.
+      // One that HAS a token (`login --codex`, `import --codex`) keeps it:
+      // reading the CLI's file over it would hand every such account the same
+      // credential, and silently replace a login the CLI never made.
+      if (acct.importFrom || (isCodex && !acct.accessToken)) {
         const from = acct.importFrom || (isCodex ? DEFAULT_CODEX_CREDENTIALS_PATH : null);
         if (!from) { console.error(`No token for "${acct.name}", skipping`); continue; }
         try {

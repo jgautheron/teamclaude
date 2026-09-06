@@ -125,3 +125,30 @@ test('non-import accounts pass through with every field intact', async () => {
   assert.equal(accounts[0].priority, 2);
   assert.deepEqual(accounts[1].models, ['glm-4']);
 });
+
+// A Codex account that carries its own token (`login --codex`, `import
+// --codex`) must keep it. Reading the Codex CLI's file over it would hand every
+// such account the same credential and silently replace a login the CLI never
+// made — the CLI file is only the default for an entry with no token at all.
+test('a Codex account with its own token is not overwritten from the Codex CLI file', async () => {
+  const [acct] = await resolveAccounts({ accounts: [
+    { name: 'own', type: 'oauth', provider: 'codex', accountId: 'acct-1', accessToken: 'mine', refreshToken: 'r', priority: 2 },
+  ] });
+  assert.equal(acct.accessToken, 'mine');
+  assert.equal(acct.accountId, 'acct-1');
+  assert.equal(acct.priority, 2);
+});
+
+test('a Codex importFrom entry reads the named auth.json and keeps its other fields', async () => {
+  await withTmp(async (dir) => {
+    const path = join(dir, 'auth.json');
+    const jwt = (o) => ['e30', Buffer.from(JSON.stringify(o)).toString('base64url'), 'sig'].join('.');
+    await writeFile(path, JSON.stringify({ tokens: { access_token: jwt({ exp: 4102444800 }), refresh_token: 'rt', account_id: 'acct-2', id_token: jwt({ 'https://api.openai.com/auth': { chatgpt_account_id: 'acct-2' } }) } }));
+    const [acct] = await resolveAccounts({ accounts: [{ name: 'cli', type: 'oauth', provider: 'codex', importFrom: path, disabled: true }] });
+    assert.equal(acct.accessToken.split('.').length, 3);
+    assert.equal(acct.refreshToken, 'rt');
+    assert.equal(acct.accountId, 'acct-2');
+    assert.equal(acct.expiresAt, 4102444800 * 1000);
+    assert.equal(acct.disabled, true);
+  });
+});
