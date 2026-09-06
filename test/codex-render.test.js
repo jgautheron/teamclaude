@@ -135,3 +135,13 @@ test('the quota summary carries the monthly window and the family buckets', () =
   assert.equal(buckets['codex:bengalfox'].name, 'GPT-5.3-Codex-Spark');
   assert.ok('monthly' in summary.aggregate);
 });
+
+test('the status payload names each account\'s provider, so a Codex row renders as one', () => {
+  const am = new AccountManager([codex('a'), { name: 'c', type: 'oauth', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 3600_000 }], 0.98);
+  const status = am.getStatus();
+  assert.equal(status.accounts[0].provider, 'codex');
+  assert.equal(status.accounts[1].provider, 'anthropic');
+  const output = renderStatus({ ...status, currentAccount: 'a', switchThreshold: 0.98 }, { color: false });
+  const codexBlock = output.slice(output.indexOf('> a'), output.indexOf('c (oauth'));
+  assert.doesNotMatch(codexBlock, /Opus/, 'the live payload must carry what the renderer keys on');
+});

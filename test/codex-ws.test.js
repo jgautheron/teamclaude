@@ -11,6 +11,11 @@ import { AccountManager } from '../src/account-manager.js';
 import { createProxyServer, codexUpgradeTarget } from '../src/server.js';
 import { relayCodexUpgrade } from '../src/codex-ws.js';
 import { FrameDecoder, encodeFrame, closeFrame, parseClose, computeAccept, OPCODE } from '../src/ws-frames.js';
+import { setUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
+
+// The relay honours a configured upstream proxy, so these tests must not
+// inherit one from the environment (see test/README.md).
+setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {}));
 
 const RESPONSES = '/backend-api/codex/responses';
 
@@ -469,4 +474,54 @@ test('codexUpgradeTarget separates Codex upgrades from everything else', () => {
   assert.deepEqual(codexUpgradeTarget(am, `/tc-acct/a${RESPONSES}`), { path: RESPONSES, pinnedIndex: 0 });
   assert.deepEqual(codexUpgradeTarget(am, `/tc-acct/zz${RESPONSES}`), { unknownPin: 'zz' });
   assert.deepEqual(codexUpgradeTarget(am, `${RESPONSES}?x=1`), { path: `${RESPONSES}?x=1`, pinnedIndex: null });
+});
+
+/** A minimal CONNECT proxy: answers 200 and splices to the requested target. */
+function fakeConnectProxy() {
+  const tunnels = [];
+  const sockets = new Set();
+  const server = net.createServer((client) => {
+    sockets.add(client);
+    let buf = '';
+    const onData = (chunk) => {
+      buf += chunk;
+      const end = buf.indexOf('\r\n\r\n');
+      if (end < 0) return;
+      client.off('data', onData);
+      const [, target] = /^CONNECT ([^ ]+) /.exec(buf) || [];
+      const [host, port] = String(target).split(':');
+      tunnels.push(target);
+      const upstream = net.connect(Number(port), host, () => {
+        sockets.add(upstream);
+        client.write('HTTP/1.1 200 Connection established\r\n\r\n');
+        const rest = buf.slice(end + 4);
+        if (rest) upstream.write(rest);
+        client.pipe(upstream); upstream.pipe(client);
+      });
+      upstream.on('error', () => client.destroy());
+      client.on('error', () => upstream.destroy());
+    };
+    client.on('data', onData);
+  });
+  // A net.Server has no closeAllConnections: the spliced sockets are ours to end.
+  return listen(server).then(port => ({ port, tunnels, close: () => { for (const s of sockets) s.destroy(); server.close(); } }));
+}
+
+test('an upstream (corporate) proxy carries the WebSocket dial as a CONNECT tunnel', async () => {
+  const proxy = await fakeConnectProxy();
+  setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: `http://127.0.0.1:${proxy.port}`, noProxy: '' }, {}));
+  try {
+    await withProxy({ 't-a': { ws: serve(33) } }, async ({ client, am, hits }) => {
+      const c = await client();
+      c.send(create('gpt-5.4'));
+      assert.equal(JSON.parse(await c.text()).type, 'codex.rate_limits');
+      assert.equal(hits.length, 1);
+      assert.equal(proxy.tunnels.length, 1, 'the dial went through the proxy');
+      assert.match(proxy.tunnels[0], /^127\.0\.0\.1:\d+$/);
+      assert.equal(am.accounts[0].quota.unified7d, 0.33);
+    }, { accounts: [codex('a')] });
+  } finally {
+    setUpstreamProxy(resolveUpstreamProxy({ upstreamProxy: false }, {}));
+    proxy.close();
+  }
 });
