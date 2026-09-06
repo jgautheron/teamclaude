@@ -13,6 +13,7 @@ import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch } from './upstream-fetch.js';
 import { applyAuthHeaders, upstreamFor, rewritesBody, providerForPath } from './provider.js';
 import { classifyCodexRejection } from './codex-quota.js';
+import { relayCodexUpgrade, refuseUpgrade, nextUpgradeId } from './codex-ws.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { safeLine } from './safe-text.js';
@@ -403,9 +404,55 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
   // same relayUpgrade onto its own terminating server in mitm.js).
-  server.on('upgrade', (req, socket, head) => relayUpgrade(req, socket, head, upstream, sx));
+  server.on('upgrade', (req, socket, head) => {
+    // A Codex WebSocket (`/backend-api/codex/responses`, optionally behind a
+    // `/tc-acct/<pin>/` prefix) is a credential-injecting relay, so unlike the
+    // Remote Control passthrough above it goes through the same gate as a
+    // request: the proxy key for a non-loopback caller, and no browser
+    // origin — an upgrade listener never sees the request handler, so the
+    // checks are repeated here rather than inherited.
+    const codex = codexUpgradeTarget(accountManager, req.url || '');
+    if (!codex) { relayUpgrade(req, socket, head, upstream, sx); return; }
+    if (codex.unknownPin != null) { refuseUpgrade(socket, 404, `Unknown account pin "${safeLine(codex.unknownPin)}"`); return; }
+    const auth = resolveClientAuth(config.proxy, req.headers['x-api-key']);
+    if (!auth.ok && !isLoopbackAddr(req.socket.remoteAddress)) { refuseUpgrade(socket, 401, 'Invalid proxy API key'); return; }
+    if (!isSameOriginControlRequest(req)) { refuseUpgrade(socket, 403, 'cross-origin WebSocket refused'); return; }
+    req.url = codex.path;
+    relayCodexUpgrade(req, socket, head, {
+      accountManager, upstream, sx, sxAgent, hooks, reqId: nextUpgradeId(),
+      pinnedIndex: codex.pinnedIndex, sessionId: sessionIdOf(req), client: auth.client,
+    });
+  });
 
   return server;
+}
+
+/**
+ * Whether an upgrade request is bound for the Codex relay, and on which
+ * account. Returns null for anything else (the Remote Control passthrough
+ * keeps those), `{ path, pinnedIndex }` for a Codex path, and
+ * `{ unknownPin }` for a pin prefix that names no account — refused rather
+ * than served by whichever account rotation would have picked, exactly as
+ * the request path does.
+ */
+export function codexUpgradeTarget(accountManager, url) {
+  let path = url;
+  let pinnedIndex = null;
+  if (url.startsWith(PIN_PREFIX)) {
+    const after = url.slice(PIN_PREFIX.length);
+    const end = after.indexOf('/');
+    if (end > 0) {
+      const candidate = after.slice(end);
+      if (providerForPath(candidate) !== 'codex') return null;
+      let token = null;
+      try { token = decodeURIComponent(after.slice(0, end)); } catch { token = null; }
+      pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
+      if (pinnedIndex == null) return { unknownPin: token ?? after.slice(0, end) };
+      path = candidate;
+    }
+  }
+  if (providerForPath(path) !== 'codex') return null;
+  return { path, pinnedIndex };
 }
 
 /**
