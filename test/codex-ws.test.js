@@ -525,3 +525,93 @@ test('an upstream (corporate) proxy carries the WebSocket dial as a CONNECT tunn
     proxy.close();
   }
 });
+
+/** A bare server that hands every upgrade to the relay with the given ctx. */
+async function relayServer(am, ctx) {
+  const server = http.createServer((req, res) => { res.writeHead(404); res.end(); });
+  server.on('upgrade', (req, socket, head) => relayCodexUpgrade(req, socket, head, { accountManager: am, upstream: 'http://unused', log: () => {}, ...ctx }));
+  const port = await listen(server);
+  return { port, close: () => { server.closeAllConnections?.(); server.close(); } };
+}
+
+test('with a hold budget, an exhausted fleet is polled until an account recovers, then dialed', async () => {
+  const up = await fakeUpstream({ 't-a': { ws: serve(5) } });
+  const am = new AccountManager([codex('a')], 0.98);
+  am.accounts[0].upstream = `http://127.0.0.1:${up.port}`;
+  am.markRateLimited(0, 1);                        // recovers in one second
+  const logs = [];
+  const ended = [];
+  const srv = await relayServer(am, { holdBudgetMs: 5_000, retryAfter: () => 1, log: (m) => logs.push(m), hooks: { onRequestEnd: (id, info) => ended.push(info) } });
+  let c;
+  try {
+    c = await connect(srv.port, RESPONSES);
+    c.send(create('gpt-5.4'));
+    const started = Date.now();
+    assert.equal(JSON.parse(await c.text()).type, 'codex.rate_limits');
+    assert.ok(Date.now() - started >= 900, 'the dial waited for the hold');
+    assert.equal(up.hits.length, 1);
+    assert.match(logs.join('\n'), /holding WebSocket, retry in 1s \(4s budget left\)/);
+  } finally {
+    c?.socket.destroy(); srv.close(); up.close();
+  }
+});
+
+test('the hold gives up with 1013 once the budget is spent', async () => {
+  const up = await fakeUpstream({ 't-a': { ws: serve() } });
+  const am = new AccountManager([codex('a')], 0.98);
+  am.accounts[0].upstream = `http://127.0.0.1:${up.port}`;
+  am.markRateLimited(0, 600);
+  const ended = [];
+  const srv = await relayServer(am, { holdBudgetMs: 300, retryAfter: () => 1, holdPollMaxMs: 100, hooks: { onRequestEnd: (id, info) => ended.push(info) } });
+  let c;
+  try {
+    c = await connect(srv.port, RESPONSES);
+    c.send(create('gpt-5.4'));
+    const close = await c.closed();
+    assert.equal(close.code, 1013);
+    assert.equal(up.hits.length, 0);
+    assert.equal(ended[0].status, 429);
+  } finally {
+    c?.socket.destroy(); srv.close(); up.close();
+  }
+});
+
+test('a client that leaves during the hold ends it without a dial', async () => {
+  const up = await fakeUpstream({ 't-a': { ws: serve() } });
+  const am = new AccountManager([codex('a')], 0.98);
+  am.accounts[0].upstream = `http://127.0.0.1:${up.port}`;
+  am.markRateLimited(0, 1);
+  const ended = [];
+  const srv = await relayServer(am, { holdBudgetMs: 5_000, retryAfter: () => 1, hooks: { onRequestEnd: (id, info) => ended.push(info) } });
+  let c;
+  try {
+    c = await connect(srv.port, RESPONSES);
+    c.send(create('gpt-5.4'));
+    await new Promise(r => setTimeout(r, 100));
+    c.socket.destroy();
+    await new Promise(r => setTimeout(r, 1300));
+    assert.equal(up.hits.length, 0, 'no dial after the client left');
+    assert.equal(ended.length, 1);
+  } finally {
+    srv.close(); up.close();
+  }
+});
+
+test('a pinned connection never holds: the pinned account is the answer', async () => {
+  const up = await fakeUpstream({ 't-a': { ws: serve() } });
+  const am = new AccountManager([codex('a')], 0.98);
+  am.accounts[0].upstream = `http://127.0.0.1:${up.port}`;
+  am.markRateLimited(0, 600);
+  const srv = await relayServer(am, { holdBudgetMs: 5_000, retryAfter: () => 1, pinnedIndex: 0 });
+  let c;
+  try {
+    c = await connect(srv.port, RESPONSES);
+    c.send(create('gpt-5.4'));
+    const close = await c.closed();
+    assert.equal(close.code, 1013);
+    assert.match(close.reason, /pinned account is unavailable \(throttled\)/);
+    assert.equal(up.hits.length, 0, 'an unavailable pinned account is refused, not dialed');
+  } finally {
+    c?.socket.destroy(); srv.close(); up.close();
+  }
+});
