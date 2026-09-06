@@ -199,3 +199,31 @@ test('before spending its refresh token, the manager adopts a newer pair the CLI
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('a rejected refresh token is recovered from by a CLI re-login in the file, without a restart', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-wb-'));
+  const orig = console.error;
+  console.error = () => {};
+  try {
+    const path = await authFile(dir);
+    const refreshed = [];
+    const am = new AccountManager([
+      { name: 'cli', type: 'oauth', provider: 'codex', accountId: 'acct-1', importFrom: path, accessToken: 'at', refreshToken: 'rt-old', expiresAt: Date.now() - 1 },
+    ], 0.98, { codexRefreshFn: async (rt) => { refreshed.push(rt); throw Object.assign(new Error('invalid_grant'), { status: 400 }); } });
+    await am.ensureTokenFresh(0);
+    assert.equal(am.accounts[0].status, 'error');
+    await am.ensureTokenFresh(0);
+    assert.deepEqual(refreshed, ['rt-old'], 'the dead token is not re-sent');
+    // The user runs `codex login`: the file holds a live pair again.
+    const fresh = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+    await writeFile(path, JSON.stringify({ tokens: { access_token: fresh, refresh_token: 'rt-cli', account_id: 'acct-1' } }), { mode: 0o600 });
+    await am.ensureTokenFresh(0);
+    assert.equal(am.accounts[0].status, 'active');
+    assert.equal(am.accounts[0].credential, fresh);
+    assert.equal(am.accounts[0].refreshToken, 'rt-cli');
+    assert.deepEqual(refreshed, ['rt-old'], 'the adopted pair is fresh, so nothing is refreshed');
+  } finally {
+    console.error = orig;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

@@ -2161,6 +2161,15 @@ export class AccountManager {
     // this the access token's 401 would force a refresh that silently does
     // nothing here and the retry would relay the 401 to the client instead of
     // rotating to another account.
+    //
+    // A Codex importFrom account holding a rejected token may have been logged
+    // in again through the CLI since — the file is where that shows. Looked at
+    // only while the guard would hold, so a healthy account costs no file read
+    // per request; a successful adoption lifts the guard like any new token.
+    if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken
+        && providerOf(account) === 'codex' && account.importFrom) {
+      await this._adoptCodexFileTokens(account);
+    }
     if (account._deadRefreshToken && account._deadRefreshToken === account.refreshToken) {
       if (account.status !== 'error') {
         account.status = 'error';
@@ -2275,6 +2284,7 @@ export class AccountManager {
     account.refreshToken = file.refreshToken;
     account.expiresAt = file.expiresAt ?? null;
     account._deadRefreshToken = null;
+    if (account.status === 'error') account.status = 'active';
     console.log(`[TeamClaude] Adopted the newer Codex token pair from ${account.importFrom} for account "${account.name}"`);
     return true;
   }
