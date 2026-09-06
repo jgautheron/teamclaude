@@ -127,13 +127,18 @@ form below keeps the file as the shared source of truth: the server re-reads
 it, and when the server itself refreshes the token it **writes the new pair
 back** into that file (atomically, mode `0600`, `last_refresh` stamped as the
 CLI does), so the Codex CLI keeps working and the next start reads a live
-token. The write-back is guarded: if the file meanwhile holds another account,
-no token pair at all (an API-key login), or a refresh token that is not the
-one the server just spent (the CLI refreshed first, or `codex login` ran
-again), the file is left alone and the server logs why, so a newer login is
-never overwritten by a stale one. `teamclaude
-accounts` never refreshes a delegating Codex entry, since it does not write the
-file.
+token. Sharing the file cuts both ways, so the server treats it as the newer
+side: before spending its refresh token it re-reads the file and **adopts** a
+pair the CLI has rotated or re-logged in the meantime (skipping the refresh
+when that pair is still fresh), and the write-back is **guarded**: if the file
+holds another account, no token pair at all (an API-key login), or a refresh
+token that is not the one just spent, or its bytes change between the check
+and the final rename, the file is left alone and the server logs why. The
+Codex CLI takes no lock on its file, so the swap cannot be made atomic
+against it; the unguarded window is the single re-read → rename pair. If
+`codex login` is a regular part of your day, `login --codex` gives TeamClaude
+a login of its own and sidesteps the sharing entirely. `teamclaude accounts`
+never refreshes a delegating Codex entry, since it does not write the file.
 
 Then tell Codex to reach TeamClaude instead of OpenAI. `teamclaude run --codex`
 does this per launch with `-c` overrides and needs nothing below; `teamclaude
