@@ -315,6 +315,14 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
     am.recordSession(sessionId, account.index, state.model);
     hooks.onRequestRouted?.(reqId, { account: account.name });
 
+    // The account is chosen after the 101, so a host already known to refuse
+    // WebSockets (accounts may sit behind different upstreams) can only be
+    // answered with a close here; it is at least not dialed again.
+    if (webSocketRefused(new URL(upstreamFor(account, upstream)).hostname)) {
+      log(`[TeamClaude] Upstream for "${account.name}" refused WebSockets recently; closing so the client takes HTTP`);
+      finish(1011, 'teamclaude: upstream 426; use HTTP', 426);
+      return;
+    }
     try {
       await am.ensureTokenFresh(account.index);
     } catch (err) {
