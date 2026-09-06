@@ -3,7 +3,7 @@
 // that file, or both the CLI and the next start hold a dead token.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, readFile, writeFile, stat, rm } from 'node:fs/promises';
+import { mkdtemp, readFile, writeFile, stat, rm, readdir } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { AccountManager } from '../src/account-manager.js';
@@ -142,6 +142,59 @@ test('the write-back refuses a file that lost its token pair, but not one that m
     const ok = await writeCodexCredentials(path, { accessToken: 'at', refreshToken: 'rt' }, { expectAccountId: 'acct-1', expectRefreshToken: 'rt-old' });
     assert.equal(ok.written, true);
     assert.equal(JSON.parse(await readFile(path, 'utf8')).tokens.refresh_token, 'rt');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the swap is abandoned when the file changes between the check and the rename', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-wb-'));
+  try {
+    const path = await authFile(dir);
+    const newLogin = JSON.stringify({ tokens: { access_token: 'b', refresh_token: 'rt-b', account_id: 'acct-B' } });
+    const result = await writeCodexCredentials(path, { accessToken: 'at-new', refreshToken: 'rt-new' }, {
+      expectAccountId: 'acct-1', expectRefreshToken: 'rt-old',
+      // The CLI saves a new login after the guards passed and the temp file is
+      // written — the interleaving a snapshot check alone cannot see.
+      beforeReplace: () => writeFile(path, newLogin),
+    });
+    assert.equal(result.written, false);
+    assert.match(result.reason, /changed while/);
+    assert.equal(await readFile(path, 'utf8'), newLogin, 'the concurrent login survives');
+    assert.deepEqual((await readdir(dir)).filter(f => f.includes('.tmp')), [], 'no temp file left behind');
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('before spending its refresh token, the manager adopts a newer pair the CLI put in the file', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-wb-'));
+  try {
+    const path = join(dir, 'auth.json');
+    const fresh = jwt({ exp: Math.floor(Date.now() / 1000) + 3600 });
+    // The CLI refreshed on its own: the file holds a live pair we have never seen.
+    await writeFile(path, JSON.stringify({ tokens: { access_token: fresh, refresh_token: 'rt-cli', account_id: 'acct-1' } }), { mode: 0o600 });
+    const refreshed = [];
+    const am = new AccountManager([
+      { name: 'cli', type: 'oauth', provider: 'codex', accountId: 'acct-1', importFrom: path, accessToken: 'at', refreshToken: 'rt-old', expiresAt: Date.now() - 1 },
+    ], 0.98, { codexRefreshFn: async (rt) => { refreshed.push(rt); return { accessToken: `at-from-${rt}`, refreshToken: `rt-from-${rt}`, expiresAt: Date.now() + 3600_000 }; } });
+    await am.ensureTokenFresh(0);
+    assert.deepEqual(refreshed, [], 'the spent-elsewhere token is never sent');
+    assert.equal(am.accounts[0].credential, fresh);
+    assert.equal(am.accounts[0].refreshToken, 'rt-cli');
+    // The file's pair is itself expired: adopt it, then refresh THAT one and write back.
+    const stale = jwt({ exp: 1 });
+    await writeFile(path, JSON.stringify({ tokens: { access_token: stale, refresh_token: 'rt-cli2', account_id: 'acct-1' } }), { mode: 0o600 });
+    am.accounts[0].expiresAt = Date.now() - 1;
+    await am.ensureTokenFresh(0);
+    assert.deepEqual(refreshed, ['rt-cli2']);
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).tokens.refresh_token, 'rt-from-rt-cli2');
+    // A file that now holds another account is left alone and ours is refreshed as usual.
+    await writeFile(path, JSON.stringify({ tokens: { access_token: stale, refresh_token: 'rt-b', account_id: 'acct-B' } }), { mode: 0o600 });
+    am.accounts[0].expiresAt = Date.now() - 1;
+    await am.ensureTokenFresh(0);
+    assert.deepEqual(refreshed, ['rt-cli2', 'rt-from-rt-cli2']);
+    assert.equal(JSON.parse(await readFile(path, 'utf8')).tokens.refresh_token, 'rt-b');
   } finally {
     await rm(dir, { recursive: true, force: true });
   }
