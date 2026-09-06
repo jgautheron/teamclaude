@@ -80,3 +80,49 @@ test('a write-back failure is logged and does not undo the refresh', async () =>
     console.error = orig;
   }
 });
+
+test('the write-back refuses a file that no longer holds what was refreshed', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-wb-'));
+  try {
+    const path = await authFile(dir);
+    // The CLI logged into another account meanwhile.
+    const other = await writeCodexCredentials(path, { accessToken: 'x', refreshToken: 'y' }, { expectAccountId: 'acct-9' });
+    assert.deepEqual(other.written, false);
+    assert.match(other.reason, /acct-1/);
+    // Another process already rotated the pair.
+    const rotated = await writeCodexCredentials(path, { accessToken: 'x', refreshToken: 'y' }, { expectRefreshToken: 'rt-someone-else' });
+    assert.equal(rotated.written, false);
+    assert.match(rotated.reason, /rotated/);
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    assert.equal(raw.tokens.refresh_token, 'rt-old', 'the file is untouched');
+    // Expectations that hold: written.
+    const ok = await writeCodexCredentials(path, { accessToken: 'x', refreshToken: 'y' }, { expectAccountId: 'acct-1', expectRefreshToken: 'rt-old' });
+    assert.equal(ok.written, true);
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test('the manager passes the account id and the refresh token it spent as the write-back expectations', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-wb-'));
+  const errors = [];
+  const orig = console.error;
+  console.error = (...a) => errors.push(a.join(' '));
+  try {
+    const path = await authFile(dir);
+    // Simulate the CLI switching accounts under us before our refresh lands.
+    await writeFile(path, JSON.stringify({ tokens: { access_token: 'b', refresh_token: 'rt-b', account_id: 'acct-B' } }));
+    const am = new AccountManager([
+      { name: 'cli', type: 'oauth', provider: 'codex', accountId: 'acct-1', importFrom: path, accessToken: 'at', refreshToken: 'rt-old', expiresAt: Date.now() - 1 },
+    ], 0.98, { codexRefreshFn: async () => ({ accessToken: 'at-new', refreshToken: 'rt-new', expiresAt: Date.now() + 3600_000 }) });
+    await am.ensureTokenFresh(0);
+    const raw = JSON.parse(await readFile(path, 'utf8'));
+    assert.equal(raw.tokens.account_id, 'acct-B');
+    assert.equal(raw.tokens.refresh_token, 'rt-b', 'account B\'s login is left alone');
+    assert.equal(am.accounts[0].credential, 'at-new', 'the in-memory refresh still stands');
+    assert.ok(errors.some(e => /Not writing the refreshed Codex token/.test(e) && /acct-B/.test(e)), errors.join('\n'));
+  } finally {
+    console.error = orig;
+    await rm(dir, { recursive: true, force: true });
+  }
+});

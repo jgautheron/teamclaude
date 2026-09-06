@@ -90,15 +90,28 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
  * is stamped the way the CLI stamps it. The write is atomic (temp + rename) so
  * a CLI reading concurrently never sees a torn file, and the mode stays 0600.
  */
-export async function writeCodexCredentials(filePath, { accessToken, refreshToken }, { home = homedir() } = {}) {
+export async function writeCodexCredentials(filePath, { accessToken, refreshToken }, { home = homedir(), expectAccountId = null, expectRefreshToken = null } = {}) {
   const resolvedPath = filePath.replace(/^~/, home);
   const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
-  raw.tokens = { ...(raw.tokens || {}), access_token: accessToken, refresh_token: refreshToken };
+  // The file is shared, so it may no longer hold what was refreshed: the CLI
+  // may have logged into another account, or rotated the pair itself. Either
+  // way the file is newer than this process and must not be overwritten —
+  // a stale write would put one account's tokens under another's identity,
+  // or discard a rotation that already invalidated ours.
+  const current = raw.tokens || {};
+  if (expectAccountId && current.account_id && current.account_id !== expectAccountId) {
+    return { written: false, reason: `the file now holds account ${current.account_id}` };
+  }
+  if (expectRefreshToken && current.refresh_token && current.refresh_token !== expectRefreshToken) {
+    return { written: false, reason: 'the file\'s refresh token was rotated by another process' };
+  }
+  raw.tokens = { ...current, access_token: accessToken, refresh_token: refreshToken };
   raw.last_refresh = new Date().toISOString();
   const tmp = `${resolvedPath}.tc-${process.pid}.tmp`;
   await writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
   await chmod(tmp, 0o600);
   await rename(tmp, resolvedPath);
+  return { written: true };
 }
 
 /**

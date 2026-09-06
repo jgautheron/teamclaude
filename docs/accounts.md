@@ -127,8 +127,12 @@ form below keeps the file as the shared source of truth: the server re-reads
 it, and when the server itself refreshes the token it **writes the new pair
 back** into that file (atomically, mode `0600`, `last_refresh` stamped as the
 CLI does), so the Codex CLI keeps working and the next start reads a live
-token. `teamclaude accounts` never refreshes a delegating Codex entry, since it
-does not write the file.
+token. The write-back is guarded: if the file meanwhile holds another account,
+or a refresh token that is not the one the server just spent (the CLI refreshed
+first, or `codex login` ran again), the file is left alone and the server logs
+why, so a newer login is never overwritten by a stale one. `teamclaude
+accounts` never refreshes a delegating Codex entry, since it does not write the
+file.
 
 Then tell Codex to reach TeamClaude instead of OpenAI. `teamclaude run --codex`
 does this per launch with `-c` overrides and needs nothing below; `teamclaude
