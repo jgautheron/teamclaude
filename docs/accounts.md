@@ -122,8 +122,13 @@ CODEX_HOME=~/.codex-second codex login
 `import --codex` warns that an OpenAI refresh token is **single-use**: whichever
 side refreshes first invalidates the other's copy, so a login copied from the
 Codex CLI stops working for the CLI once TeamClaude refreshes it (and vice
-versa). `login --codex` gives TeamClaude a login of its own; the `importFrom`
-form below keeps the Codex CLI as the owner and re-reads its file instead.
+versa). `login --codex` gives TeamClaude a login of its own. The `importFrom`
+form below keeps the file as the shared source of truth: the server re-reads
+it, and when the server itself refreshes the token it **writes the new pair
+back** into that file (atomically, mode `0600`, `last_refresh` stamped as the
+CLI does), so the Codex CLI keeps working and the next start reads a live
+token. `teamclaude accounts` never refreshes a delegating Codex entry, since it
+does not write the file.
 
 Then tell Codex to reach TeamClaude instead of OpenAI. `teamclaude run --codex`
 does this per launch with `-c` overrides and needs nothing below; `teamclaude

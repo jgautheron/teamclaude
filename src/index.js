@@ -1324,6 +1324,10 @@ async function accountsCommand() {
   await Promise.all(config.accounts.map(async (a) => {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
+    // A delegating Codex entry has no token of its own to refresh here: the
+    // refresh token is the CLI file's, single-use, and this command does not
+    // write the file. The server refreshes it and writes it back.
+    if (providerOf(a) === 'codex' && a.importFrom) return;
     try {
       const newTokens = providerOf(a) === 'codex'
         ? await refreshCodexToken(a.refreshToken)

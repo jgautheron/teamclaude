@@ -10,7 +10,7 @@
 // using the Codex CLI's own client id, so a pooled account stays live the same
 // way an Anthropic one does.
 
-import { readFile } from 'node:fs/promises';
+import { readFile, writeFile, rename, chmod } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { randomBytes, createHash } from 'node:crypto';
 import { exec } from 'node:child_process';
@@ -75,6 +75,30 @@ export async function importCodexCredentials(filePath = DEFAULT_CODEX_CREDENTIAL
     email: claims.email,
     planType: auth.chatgpt_plan_type,
   };
+}
+
+/**
+ * Write refreshed tokens back into a Codex CLI credentials file.
+ *
+ * An OpenAI refresh token is single-use: the grant that minted the new pair
+ * invalidated the one still sitting in the file, so an `importFrom` account
+ * that refreshed in memory and left the file alone would (a) hand the Codex CLI
+ * a dead refresh token and (b) re-read that same dead token at the next start.
+ * Writing the pair back keeps the file the shared source of truth, which is the
+ * whole point of delegating to it. The rest of the file (`id_token`,
+ * `account_id`, `OPENAI_API_KEY`, `auth_mode`) is preserved; `last_refresh`
+ * is stamped the way the CLI stamps it. The write is atomic (temp + rename) so
+ * a CLI reading concurrently never sees a torn file, and the mode stays 0600.
+ */
+export async function writeCodexCredentials(filePath, { accessToken, refreshToken }, { home = homedir() } = {}) {
+  const resolvedPath = filePath.replace(/^~/, home);
+  const raw = JSON.parse(await readFile(resolvedPath, 'utf-8'));
+  raw.tokens = { ...(raw.tokens || {}), access_token: accessToken, refresh_token: refreshToken };
+  raw.last_refresh = new Date().toISOString();
+  const tmp = `${resolvedPath}.tc-${process.pid}.tmp`;
+  await writeFile(tmp, JSON.stringify(raw, null, 2) + '\n', { mode: 0o600 });
+  await chmod(tmp, 0o600);
+  await rename(tmp, resolvedPath);
 }
 
 /**
