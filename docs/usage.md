@@ -70,6 +70,10 @@ Switched to "me@example.com"
 Warning: "me@example.com" is disabled, so requests will not route to it until that changes.
 ```
 
+A fleet holding both Claude and Codex accounts is drawn as two panes side by
+side (Claude left, Codex right) when the terminal is wide enough for both; see
+[Codex accounts](accounts.md#how-it-shares-the-port-with-claude).
+
 ### TUI keyboard shortcuts
 
 | Key | Action |
