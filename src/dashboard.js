@@ -41,6 +41,15 @@ export function scopedWeeklyRows(quota) {
     if (Object.prototype.hasOwnProperty.call(scoped, f.family) || f.u == null) return;
     rows.push({ family: f.family, label: f.label, utilization: f.u, resetAt: f.r });
   });
+  // Codex model buckets: keyed by header slug, labelled by the family name
+  // upstream reports. Written out longhand because this function is also
+  // shipped inside the page script, which cannot import model.js.
+  var codex = q.codexModelBuckets || {};
+  Object.keys(codex).forEach(function (slug) {
+    var b = codex[slug] || {};
+    if (b.utilization == null) return;
+    rows.push({ family: 'codex:' + slug, label: b.name || slug, utilization: b.utilization, resetAt: b.resetAt });
+  });
   rows.sort(function (a, b) { return a.family < b.family ? -1 : a.family > b.family ? 1 : 0; });
   return rows;
 }
@@ -304,9 +313,10 @@ ${SHARED_HELPERS}
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
     var q = a.quota || {};
-    if (q.unified5h != null || q.unified7d != null) {
+    if (q.unified5h != null || q.unified7d != null || q.unified30d != null) {
       card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
-      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      if (q.unified7d != null || q.unified30d == null) card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      if (q.unified30d != null) card.appendChild(quotaRow('Monthly', q.unified30d, q.unified30dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
       // fields drew an incomplete picture the moment upstream metered a third.

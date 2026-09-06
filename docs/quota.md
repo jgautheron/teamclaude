@@ -34,7 +34,7 @@ teamclaude probe        # show current setting
 
 The **Quota probe** row on the TUI settings screen (`g`) does the same thing, and `p` on the main screen is a one-shot refresh of every account.
 
-It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. API-key and third-party accounts are skipped. Minimum interval is 30s. Changing it takes effect on a running server immediately.
+It reads each OAuth account's utilization from Anthropic's usage endpoint (`/api/oauth/usage`), which reports quota **without consuming any message quota**. A Codex account is read from its own zero-spend endpoint (`chatgpt.com/backend-api/wham/usage`, the one the Codex CLI polls for its status line), which names the plan, the shared windows and every model-scoped family. API-key and third-party accounts are skipped. Minimum interval is 30s. Changing it takes effect on a running server immediately.
 
 The probe is also the only source for the **Sonnet 7-day** bucket, when your plan exposes it. The Fable weekly bucket arrives passively in the response headers (`anthropic-ratelimit-unified-7d_oi-*`), so Fable-aware routing works without turning the probe on. Both families are read from the payload's `limits[]`, where upstream enumerates the model-scoped weekly caps an account actually has.
 
@@ -47,6 +47,20 @@ So a spent family reading is trusted for 30 minutes. After that it is dropped, t
 Running the probe sidesteps this entirely — it refreshes the family buckets from the usage endpoint without spending quota, so a reset is picked up within one probe interval instead of within the staleness window.
 
 A probe revalidates a family bucket in full, which includes concluding that there is no cap. When the payload enumerates an account's scoped weekly caps and a family is **not** among them, the cached reading is cleared and that family falls back to the shared weekly bucket — upstream retiring a cap must not leave the proxy gating on it. A payload that carries no such enumeration proves nothing, so nothing changes. Each reported bucket also carries its own reset, taken verbatim: an unstarted window has no reset, and the bar shows no date rather than the shared weekly one.
+
+## Codex windows
+
+A Codex account reports three kinds of window, and TeamClaude reads all of them from response headers, from the WebSocket `codex.rate_limits` event, and from the probe alike:
+
+- **Shared 5-hour and weekly** windows land in the same `unified5h`/`unified7d` fields an Anthropic account fills, so the switch threshold, the reset countdowns and the bars need nothing Codex-specific.
+- A **30-day window** (`unified30d`) is the only window some plans meter (Go, Free). It gates on its own: an account at 100% of its month is spent even though it has no weekly reading at all. The TUI draws it in the weekly slot as `Mo` when there is no weekly, and `teamclaude status` prints a `Monthly` line whenever it is reported.
+- **Model-scoped families** (`GPT-5.3-Codex-Spark`, for one) carry their own weekly bucket, the counterpart of Anthropic's Fable bucket. They are learned from upstream rather than declared, keyed by the slug the headers use (`x-codex-bengalfox-*` → `bengalfox`) and matched to a request by the family's display name, so a spent Spark bucket bars Spark on that account and nothing else. Each gets a bar in the TUI (`Sp7`), a line in `teamclaude status`, a row in the dashboard, and a `codex:<slug>` entry in `/teamclaude/quota`. A spent family reading is trusted for the same 30 minutes an Anthropic family reading is, for the same reason: only a request of that family could refresh it, and rotation has stopped sending those (see [Revalidating a spent family bucket](#revalidating-a-spent-family-bucket)). The probe sidesteps that here too.
+
+The threshold and cap keys are `unified30d` for the month and `codex:<slug>` for a family:
+
+```json
+"switchThreshold": { "default": 0.98, "unified30d": 0.9, "codex:bengalfox": 0.8 }
+```
 
 ## Keep-warm
 

@@ -8,12 +8,16 @@
 // probe reads a zero-spend endpoint and never consumes message quota.
 
 import { fetchUsage } from './oauth.js';
+import { fetchCodexUsage } from './codex-quota.js';
 
 export class Prober {
-  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, profileFn = null, timeoutMs = 10_000, log = console.log } = {}) {
+  constructor(accountManager, { intervalMs = 0, probeFn = fetchUsage, codexProbeFn = fetchCodexUsage, profileFn = null, timeoutMs = 10_000, log = console.log } = {}) {
     this.am = accountManager;
     this.intervalMs = intervalMs;
     this.probeFn = probeFn;
+    // A Codex account reads its own zero-spend endpoint, which needs the
+    // ChatGPT account id as well as the token.
+    this.codexProbeFn = codexProbeFn;
     this.profileFn = profileFn;
     this.timeoutMs = timeoutMs;
     this.log = log;
@@ -73,12 +77,16 @@ export class Prober {
     const startedAt = Date.now();
     this._recordAccount(account, { status: 'running', startedAt });
     try {
+      const isCodex = account.provider === 'codex';
+      const probe = () => isCodex
+        ? this.codexProbeFn(account.credential, account.accountId)
+        : this.probeFn(account.credential);
       await this.am.ensureTokenFresh(account.index);
-      let usage = await this._withTimeout(this.probeFn(account.credential));
+      let usage = await this._withTimeout(probe());
       if (usage?.status === 401) {
         // Token rejected: force refresh and retry once.
         await this.am.ensureTokenFresh(account.index, true);
-        usage = await this._withTimeout(this.probeFn(account.credential));
+        usage = await this._withTimeout(probe());
       }
 
       if (!usage || usage.error) {
@@ -93,8 +101,10 @@ export class Prober {
         return;
       }
 
-      this.am.applyUsageData(account.index, usage);
-      const missingTier = !account.rateLimitTier && !account.seatTier
+      if (isCodex) this.am.applyCodexUsageData(account.index, usage);
+      else this.am.applyUsageData(account.index, usage);
+      // The profile endpoint is Anthropic's; a Codex reading already names its plan.
+      const missingTier = !isCodex && !account.rateLimitTier && !account.seatTier
         && account.hasClaudeMax == null && account.hasClaudePro == null;
       if (missingTier && this.profileFn) {
         const profile = await this._withTimeout(this.profileFn(account.credential));

@@ -85,6 +85,57 @@ export function gatingUtilization(quota, bucketKey) {
   return Math.max(own, shared);
 }
 
+// ── Codex quota buckets ─────────────────────────────────────────────────────
+//
+// A Codex account meters model families the way Anthropic meters Fable: a
+// weekly bucket per family, reported only on that family's responses. They are
+// learned rather than declared (upstream owns the list), so the account stores
+// them keyed by the header slug: { bengalfox: { name: 'GPT-5.3-Codex-Spark',
+// utilization, resetAt, seenAt } }. The threshold/cap key of such a bucket is
+// `codex:<slug>`. Every renderer reads them through these helpers so the bars,
+// the status text and the router agree on which buckets exist and what gates
+// them.
+
+export const CODEX_BUCKET_PREFIX = 'codex:';
+
+/** The Codex model buckets on a quota, sorted by slug, each with its threshold
+ * key and a short label for the TUI row. Empty for any non-Codex quota. */
+export function codexBucketEntries(quota) {
+  const buckets = quota?.codexModelBuckets;
+  if (!buckets || typeof buckets !== 'object') return [];
+  return Object.entries(buckets)
+    .filter(([, b]) => b && typeof b === 'object' && b.utilization != null)
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([slug, b]) => ({
+      slug,
+      key: CODEX_BUCKET_PREFIX + slug,
+      name: b.name || slug,
+      label: codexBucketLabel(b.name || slug),
+      utilization: b.utilization,
+      resetAt: b.resetAt ?? null,
+    }));
+}
+
+/** A three-column TUI label for a family bucket, in the style of `F7`/`S7`:
+ * the first two letters of the family's own word (the last hyphenated segment
+ * of `GPT-5.3-Codex-Spark` is `Spark`) plus the window, so `Sp7`. */
+export function codexBucketLabel(name) {
+  const word = String(name || '').split(/[-_\s]+/).filter(Boolean).pop() || '?';
+  const two = (word[0] || '?').toUpperCase() + (word[1] || '').toLowerCase();
+  return `${two}7`;
+}
+
+/** The utilization that gates a Codex family bucket: the higher of the bucket
+ * and the shared weekly, for the reason `gatingUtilization` gives — family
+ * spend meters into both. Null when neither is reported. */
+export function codexGatingUtilization(quota, entry) {
+  const own = entry?.utilization ?? null;
+  const shared = quota?.unified7d ?? null;
+  if (own == null) return shared;
+  if (shared == null) return own;
+  return Math.max(own, shared);
+}
+
 // Match a shell-style glob against a model id. Only `*` is special (matches any
 // run of characters, including none); every other character is literal. The
 // comparison is case-insensitive. Used by configurable routes so a pattern like

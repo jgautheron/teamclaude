@@ -81,7 +81,9 @@ const THRESHOLD_USAGE = [
 // The buckets a threshold can be keyed by: the quota windows the manager asks
 // thresholdFor() about. An unknown key would be accepted by the config and then
 // never consulted, so the CLI refuses it rather than storing a typo.
-const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'tokens', 'requests'];
+const QUOTA_BUCKETS = ['unified5h', 'unified7d', 'unified7dSonnet', 'unified7dFable', 'unified30d', 'tokens', 'requests'];
+// A Codex model-scoped bucket is named by its header slug: `codex:bengalfox`.
+const CODEX_BUCKET_KEY = /^codex:[a-z0-9_-]+$/;
 
 const DISTRIBUTE_USAGE = 'Usage: teamclaude distribute <on|off>';
 
@@ -1595,8 +1597,8 @@ async function thresholdCommand() {
     const at = pair.indexOf('=');
     const bucket = pair.slice(0, at);
     const value = pair.slice(at + 1);
-    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket)) {
-      console.error(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}`);
+    if (bucket !== 'default' && !QUOTA_BUCKETS.includes(bucket) && !CODEX_BUCKET_KEY.test(bucket)) {
+      console.error(`Unknown quota bucket "${bucket}" — expected one of: default, ${QUOTA_BUCKETS.join(', ')}, codex:<slug>`);
       process.exit(1);
     }
     if (value === 'default') {

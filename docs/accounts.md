@@ -163,17 +163,23 @@ and one TUI.
 Codex reports its limits on every response, and TeamClaude normalises them into
 the same fields the Anthropic path fills — so the switch threshold, reset
 countdowns and the TUI's quota bars work for Codex accounts too, and rotation
-happens *before* upstream refuses rather than after a 429.
+happens *before* upstream refuses rather than after a 429. The
+[quota probe](quota.md#quota-probe) reads Codex accounts from their own
+zero-spend endpoint, and a spent window, a 402, or an entitlement 403 each take
+the path described under [Codex refusals](routing.md#codex-refusals).
 
-Two details are worth knowing if you read the raw headers:
+Three details are worth knowing if you read the raw headers:
 
 - Limits arrive in families. The unnamed one is the account-wide limit; a family
   carrying `-limit-name` is model-scoped, the counterpart of Anthropic's Fable
-  weekly bucket.
+  weekly bucket. Each family gets its own bar, threshold key and cap key
+  (`codex:<slug>`) — see [Codex windows](quota.md#codex-windows).
 - `primary` and `secondary` are positions, not durations — the account-wide
   family can put its 7-day window in `primary` while a model-scoped family puts
   a 5-hour window there. Windows are classified by their stated
   `window-minutes`, never by position.
+- A plan that meters a 30-day window (Go, Free) is gated on it (`unified30d`),
+  since such a plan reports no weekly window at all.
 
 ## Third-party backend accounts
 
