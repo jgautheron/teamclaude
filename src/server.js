@@ -421,6 +421,9 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     relayCodexUpgrade(req, socket, head, {
       accountManager, upstream, sx, sxAgent, hooks, reqId: nextUpgradeId(),
       pinnedIndex: codex.pinnedIndex, sessionId: sessionIdOf(req), client: auth.client,
+      // The same hold as a request gets (see forwardRequest), with the same
+      // estimate of when the fleet next recovers.
+      holdBudgetMs: holdMs, retryAfter: () => computeRetryAfter(accountManager.getStatus().accounts),
     });
   });
 

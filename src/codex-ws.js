@@ -31,6 +31,11 @@
 //      it. Once an account has become ineligible mid-connection, the relay
 //      waits for the response in flight to end and then closes the client
 //      with 1012, so the next connection is routed afresh.
+//   5. When no account has headroom and `holdSeconds` is set, the relay holds
+//      the (already open) client connection and re-selects on a bounded poll,
+//      as forwardRequest holds a request. Codex is waiting for its first
+//      response event, so this is invisible to it as long as its stream idle
+//      timeout outlasts the hold — which is what `run --codex` arranges.
 //
 // The upstream 101 carried no quota headers in any live capture; the
 // `codex.rate_limits` frame that opens every response does. Both are read.
@@ -105,6 +110,7 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
     reqId = nextUpgradeId(), pinnedIndex = null, sessionId = null, client = null,
     log = console.log,
     firstFrameTimeoutMs = FIRST_FRAME_TIMEOUT_MS, dialTimeoutMs = DIAL_TIMEOUT_MS,
+    holdBudgetMs = 0, retryAfter = () => 60, holdPollMaxMs = 60_000,
   } = ctx;
   const path = req.url || '/';
   const key = req.headers['sec-websocket-key'];
@@ -137,12 +143,15 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
     inResponse: false,     // a response is streaming; rotation waits for its end
     rotateAfterResponse: false,
     endStatus: null,
+    holdBudgetMs,
+    holdTimer: null,
   };
 
   const finish = (code, reason, status) => {
     if (state.closed) return;
     state.closed = true;
     clearTimeout(firstFrameTimer);
+    clearTimeout(state.holdTimer);
     if (!socket.destroyed) {
       if (code != null) { try { socket.write(closeFrame(code, reason)); } catch { /* peer gone */ } }
       socket.end();
@@ -228,10 +237,36 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
   async function attempt() {
     if (state.closed) return;
     // A pin is hard: the pinned account or nothing, never a failover.
+    const pinned = pinnedIndex != null ? am.accounts[pinnedIndex] : null;
+    if (pinned && !state.tried.has(pinnedIndex)) {
+      // As on the HTTP path: a pin targets exactly this account, and one that
+      // cannot serve right now is refused rather than dialed and rotated.
+      const why = am.unavailableReason(pinned, state.model);
+      if (why) {
+        state.endStatus = 429;
+        finish(1013, `teamclaude: pinned account is unavailable (${why}); retry shortly`, 429);
+        return;
+      }
+    }
     const account = pinnedIndex != null
-      ? (state.tried.has(pinnedIndex) ? null : am.accounts[pinnedIndex])
+      ? (state.tried.has(pinnedIndex) ? null : pinned)
       : am.getActiveAccount(state.tried, state.model, null, sessionId, 'codex');
     if (!account) {
+      // Long-hold mode, as on the HTTP path: keep the client open and poll
+      // until an account recovers or the budget runs out. The per-poll sleep
+      // is capped so an account re-enabled or reset early is picked up within
+      // a minute. `tried` is cleared for the retry: an account whose window
+      // reset during the hold is exactly the one to try next. A pin never
+      // holds — the pinned account is unavailable, and that is the answer.
+      if (pinnedIndex == null && state.holdBudgetMs > 0) {
+        const waitMs = Math.min(retryAfter() * 1000, state.holdBudgetMs, holdPollMaxMs);
+        state.holdBudgetMs -= waitMs;
+        log(`[TeamClaude] All Codex accounts exhausted — holding WebSocket, retry in ${Math.ceil(waitMs / 1000)}s (${Math.ceil(state.holdBudgetMs / 1000)}s budget left)`);
+        await new Promise((resolve) => { state.holdTimer = setTimeout(resolve, waitMs); });
+        if (state.closed) return;
+        state.tried.clear();
+        return attempt();
+      }
       state.endStatus = 429;
       finish(1013, 'teamclaude: no Codex account has headroom; retry later', 429);
       return;

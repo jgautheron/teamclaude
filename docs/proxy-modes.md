@@ -80,9 +80,15 @@ TeamClaude relays that connection rather than splicing it blind:
   client with `1012`; Codex reconnects with its full input, and the new
   connection is routed afresh. Verified live: a turn closed after every
   response reconnected each time and finished correctly.
+- When **no account has headroom** and `holdSeconds` is set, the connection is
+  kept open and re-routed on the same poll the HTTP path uses ([hold on
+  exhaustion](quota.md#hold-on-exhaustion)); without a hold it closes with
+  `1013` at once.
 - A [`TC_ACCT` pin](routing.md#pin-a-session-to-one-account) is hard here
-  too: the pinned account or a close, never another account. A pin naming no
-  account is refused with `404` before any upstream is touched.
+  too: the pinned account or a close, never another account, and never a
+  hold — a pinned account that cannot serve right now is refused with `1013`
+  before any upstream is touched. A pin naming no account is refused with
+  `404`.
 
 The upgrade is gated exactly like a request — the proxy key for a non-loopback
 caller, a browser `Origin` refused with `403` — because unlike the Remote
