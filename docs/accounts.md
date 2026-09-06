@@ -130,7 +130,8 @@ CLI does), so the Codex CLI keeps working and the next start reads a live
 token. Sharing the file cuts both ways, so the server treats it as the newer
 side: before spending its refresh token it re-reads the file and **adopts** a
 pair the CLI has rotated or re-logged in the meantime (skipping the refresh
-when that pair is still fresh), and the write-back is **guarded**: if the file
+when that pair is still fresh; this is also how an entry whose refresh token
+was rejected comes back after `codex login`, with no restart), and the write-back is **guarded**: if the file
 holds another account, no token pair at all (an API-key login), or a refresh
 token that is not the one just spent, or its bytes change between the check
 and the final rename, the file is left alone and the server logs why. The
