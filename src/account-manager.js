@@ -1,6 +1,6 @@
 import { refreshAccessToken, isTokenExpiringSoon, isTokenExpired, formatMoney } from './oauth.js';
 import { providerOf, DEFAULT_PROVIDER } from './provider.js';
-import { refreshCodexToken } from './codex-auth.js';
+import { refreshCodexToken, writeCodexCredentials } from './codex-auth.js';
 import { parseCodexQuota, parseCodexPlanType } from './codex-quota.js';
 import { sameIdentity } from './identity.js';
 import { weeklyBucketForModel, modelGlobMatches, modelFamily, gatingUtilization, resolveMaxUsage } from './model.js';
@@ -128,6 +128,9 @@ function makeAccount(acct, index) {
     // that id. The Anthropic counterpart is `accountUuid`, which is patched
     // into the request body instead.
     accountId: acct.accountId || null,
+    // The credentials file an entry delegates to, when it does. A Codex
+    // refresh has to be written back there (see ensureTokenFresh).
+    importFrom: acct.importFrom || null,
     accountUuid: acct.accountUuid || null,
     orgUuid: acct.orgUuid || null,
     orgName: acct.orgName || null,
@@ -213,12 +216,13 @@ function sampleModelFor(route) {
 }
 
 export class AccountManager {
-  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
+  constructor(accounts, switchThreshold = 0.98, { refreshFn = refreshAccessToken, codexRefreshFn = refreshCodexToken, codexWriteBackFn = writeCodexCredentials, throttleProbeFloorMs, familyStaleMs, statusStaleMs, forcedRefreshFloorMs = FORCED_REFRESH_FLOOR_MS, routes, ramp, distributeSessions = false, sessionTracker } = {}) {
     // How long a just-minted token is trusted against a forced refresh.
     this._forcedRefreshFloorMs = forcedRefreshFloorMs;
     // Injectable for tests (mirrors Prober's probeFn); defaults to the real
     // OAuth token refresh.
     this._refreshFn = refreshFn;
+    this._codexWriteBackFn = codexWriteBackFn;
     this._codexRefreshFn = codexRefreshFn;
     this.accounts = accounts.map((acct, index) => makeAccount(acct, index));
     this.currentIndex = 0;
@@ -2201,6 +2205,17 @@ export class AccountManager {
         account._deadRefreshToken = null; // this token works; clear any stale guard
         console.log(`[TeamClaude] Token refreshed for account "${account.name}"`);
         this._onTokenRefresh?.(accountIndex, newTokens);
+        // A Codex importFrom account owns no copy in config.json (the save
+        // keeps delegating entries delegating), and the refresh token it just
+        // spent was the file's. Put the new pair where the file, the Codex CLI
+        // and the next start will all read it.
+        if (providerOf(account) === 'codex' && account.importFrom) {
+          try {
+            await this._codexWriteBackFn(account.importFrom, newTokens);
+          } catch (err) {
+            console.error(`[TeamClaude] Could not write the refreshed Codex token back to ${account.importFrom}: ${err.message} — the Codex CLI's copy is now stale; run: codex login`);
+          }
+        }
       } catch (err) {
         console.error(`[TeamClaude] Token refresh failed for "${account.name}": ${err.message}`);
         // Reserve 'error' (which drops the account from rotation until re-login)

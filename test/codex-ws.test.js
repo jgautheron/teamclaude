@@ -12,6 +12,7 @@ import { createProxyServer, codexUpgradeTarget } from '../src/server.js';
 import { relayCodexUpgrade } from '../src/codex-ws.js';
 import { FrameDecoder, encodeFrame, closeFrame, parseClose, computeAccept, OPCODE } from '../src/ws-frames.js';
 import { setUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
+import { SessionTracker } from '../src/session-tracker.js';
 
 // The relay honours a configured upstream proxy, so these tests must not
 // inherit one from the environment (see test/README.md).
@@ -613,5 +614,39 @@ test('a pinned connection never holds: the pinned account is the answer', async 
     assert.equal(up.hits.length, 0, 'an unavailable pinned account is refused, not dialed');
   } finally {
     c?.socket.destroy(); srv.close(); up.close();
+  }
+});
+
+test('a WebSocket session is pinned to its account: with distribution on, a thread stays put and a new thread spreads', async () => {
+  const both = { 't-a': { ws: serve() }, 't-b': { ws: serve() } };
+  const up = await fakeUpstream(both);
+  // activeTtlMs 0: "active" then means "a connection is open", so the count
+  // follows the connections exactly instead of lingering for the idle window.
+  const am = new AccountManager([codex('a'), codex('b')], 0.98, { distributeSessions: true, sessionTracker: new SessionTracker({ activeTtlMs: 0 }) });
+  for (const a of am.accounts) a.upstream = `http://127.0.0.1:${up.port}`;
+  const proxy = createProxyServer(am, { proxy: { apiKey: 'k' }, upstream: 'http://unused' });
+  const port = await listen(proxy);
+  const open = [];
+  try {
+    const turn = async (session, activeSessions) => {
+      const c = await connect(port, RESPONSES, { 'session-id': session });
+      open.push(c);
+      c.send(create('gpt-5.4'));
+      await c.text();
+      assert.equal(am.sessionStats().active, activeSessions, 'an open connection keeps its session active');
+      return up.hits.at(-1).token;
+    };
+    const first = await turn('thread-1', 1);
+    const second = await turn('thread-1', 1);
+    assert.equal(second, first, 'the same thread lands on the same account, so its prompt cache is reused');
+    const other = await turn('thread-2', 2);
+    assert.notEqual(other, first, 'a new thread goes to the least-loaded account');
+    assert.equal(am.sessionStats().known, 2);
+    for (const c of open) c.socket.destroy();
+    await new Promise(r => setTimeout(r, 30));
+    assert.equal(am.sessionStats().active, 0, 'closing the connections ends the sessions in flight');
+  } finally {
+    for (const c of open) c.socket?.destroy();
+    proxy.closeAllConnections?.(); proxy.close(); up.close();
   }
 });

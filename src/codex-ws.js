@@ -120,6 +120,14 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
   }
 
   hooks.onRequestStart?.(reqId, { method: 'WS', path, sessionId, pinned: pinnedIndex != null, client });
+  // The session is "in flight" for the connection's whole life, exactly as a
+  // request is for its duration: counted as active, never expired mid-turn.
+  // And once an account is chosen, the session is pinned to it — that pin is
+  // what keeps a Codex thread on ONE account across its turns, which is what
+  // its prompt cache (keyed by the thread's `prompt_cache_key`, held per
+  // account for 24h) depends on. Without it, session distribution would treat
+  // every connection as a new session and spread one thread across the pool.
+  am.beginSession(sessionId, { client });
 
   // Step 1: the client's handshake completes here, before any account exists.
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${computeAccept(key)}\r\n\r\n`);
@@ -160,6 +168,7 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
     }
     state.upstreamSocket?.destroy();
     state.upstreamReq?.destroy();
+    am.endSession(sessionId);
     hooks.onRequestEnd?.(reqId, {
       method: 'WS', path,
       account: state.account ? state.account.name : '(no account)',
@@ -272,6 +281,7 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
       return;
     }
     state.account = account;
+    am.recordSession(sessionId, account.index, state.model);
     hooks.onRequestRouted?.(reqId, { account: account.name });
 
     try {

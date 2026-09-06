@@ -79,12 +79,19 @@ test('a 5-hour account window lands in the 5h bucket', () => {
   assert.equal(q.unified7d, undefined);
 });
 
-test('an unrecognised window duration is ignored rather than guessed at', () => {
-  const q = parseCodexQuota({
+test('a window with no usable duration is ignored; any stated duration is filed by range', () => {
+  // No duration, a zero duration, an unparseable utilization: dropped, since
+  // "not applicable" must not read as headroom or as spend.
+  const dropped = parseCodexQuota({
     'x-codex-primary-used-percent': '50',
-    'x-codex-primary-window-minutes': '42',
+    'x-codex-secondary-used-percent': '60', 'x-codex-secondary-window-minutes': '0',
   });
-  assert.deepEqual(q, {});
+  assert.equal(dropped.unified5h, undefined);
+  assert.equal(dropped.unified7d, undefined);
+  // A stated duration always lands somewhere: a reading that matched no exact
+  // duration used to vanish, and a vanished 100% is full headroom.
+  const ranged = parseCodexQuota({ 'x-codex-primary-used-percent': '100', 'x-codex-primary-window-minutes': '4321' });
+  assert.equal(ranged.unified7d, 1);
 });
 
 // The catalog fetch carries no quota; that must not look like 0% used.

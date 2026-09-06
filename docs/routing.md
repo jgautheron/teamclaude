@@ -37,7 +37,7 @@ A Codex account does not send the `unified-*-status` headers, so its refusals ar
 - A **403 naming a model or workspace entitlement** (`codex_entitlement_missing`, `codex_workspace_access_denied`) cools the account down for five minutes like an OAuth policy denial below, and fails over. Shared quota is untouched.
 - Any **other 429** is the per-minute throttle and takes the rate-limit path: pause, one failover hop, inline wait. Never a rotation.
 
-The same classes apply to a refused WebSocket handshake, with the outcomes described under [Codex over WebSocket](proxy-modes.md#codex-over-websocket).
+The same classes apply to a refused WebSocket handshake, with the outcomes described under [Codex over WebSocket](proxy-modes.md#codex-over-websocket). A refusal whose body names no code but says "usage limit", "quota" or "credits depleted" in words is a spent quota too; upstream has been seen to wrap those without a code.
 
 ## OAuth entitlement denials
 

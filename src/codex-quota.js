@@ -51,17 +51,16 @@ import { proxyFetch } from './upstream-fetch.js';
 const USAGE_URL = 'https://chatgpt.com/backend-api/wham/usage';
 
 /** Window durations we recognise, in minutes, with a tolerance for rounding. */
-const FIVE_HOUR_MINUTES = 300;
 const SEVEN_DAY_MINUTES = 10080;
 // Anything from 28 days up is the monthly window. It is not a fixed length
 // upstream (28-day and 30-day readings both occur), so a floor rather than a
 // tolerance band.
 const MONTH_MINUTES_MIN = 28 * 24 * 60;
-const WINDOW_TOLERANCE = 0.1;
+const DAY_MINUTES = 24 * 60;
 
-const near = (value, target) => Math.abs(value - target) <= target * WINDOW_TOLERANCE;
-
-const HEADER_RE = /^x-codex-(?:(.+)-)?(primary|secondary)-(used-percent|window-minutes|reset-at)$/;
+// `tertiary` exists on the usage wire (a third window on some plans) and is
+// accepted here too, so a header carrying it is filed rather than dropped.
+const HEADER_RE = /^x-codex-(?:(.+)-)?(primary|secondary|tertiary)-(used-percent|window-minutes|reset-at)$/;
 const LIMIT_NAME_RE = /^x-codex-(.+)-limit-name$/;
 
 /**
@@ -94,12 +93,35 @@ function collectFamilies(headers) {
   return families;
 }
 
-/** The bucket a window of `minutes` belongs to, or null when unrecognised. */
+/**
+ * The bucket a window of `minutes` belongs to, or null for no duration.
+ *
+ * Duration decides, by range rather than by exact match: any sub-day window
+ * is the burst ("session") reading, anything up to a month is the weekly one,
+ * and a month or more is the monthly one. OpenAI has already removed and
+ * restored the 5-hour window once (Plus/Team have it back, Pro is weekly-only),
+ * and a plan may yet report a 3-hour or a 1-day burst; a reading that matched
+ * no exact duration used to be dropped, which is the one outcome that must
+ * not happen — a dropped 100% reads as full headroom.
+ */
 function bucketForMinutes(minutes) {
   if (!Number.isFinite(minutes) || minutes <= 0) return null;
-  if (near(minutes, FIVE_HOUR_MINUTES)) return 'fiveHour';
-  if (near(minutes, SEVEN_DAY_MINUTES)) return 'weekly';
-  if (minutes >= MONTH_MINUTES_MIN) return 'monthly';
+  if (minutes < DAY_MINUTES) return 'fiveHour';
+  if (minutes < MONTH_MINUTES_MIN) return 'weekly';
+  return 'monthly';
+}
+
+/**
+ * A reset instant in epoch milliseconds. Every Codex wire states `reset_at`
+ * in epoch seconds today, but a value that is already milliseconds must not
+ * be multiplied into the year 58,000 — and a window that states only
+ * `reset_after_seconds` still resets at a knowable time.
+ */
+function resetMs(w, now = Date.now()) {
+  const at = Number(w.resetAt);
+  if (Number.isFinite(at) && at > 0) return at > 1e11 ? at : at * 1000;
+  const after = Number(w.resetAfterSeconds);
+  if (Number.isFinite(after) && after > 0) return now + after * 1000;
   return null;
 }
 
@@ -125,7 +147,7 @@ function classify(windows) {
       // here rather than teaching every consumer about percentages.
       utilization: percent / 100,
       // Epoch seconds upstream, milliseconds everywhere in this codebase.
-      resetAt: Number.isFinite(w.resetAt) && w.resetAt > 0 ? w.resetAt * 1000 : null,
+      resetAt: resetMs(w),
     };
   }
   return out;
@@ -210,7 +232,7 @@ export function familySlug({ meteredFeature, limitName }) {
  * collector would have recorded it. */
 function eventWindow(w) {
   if (!w || typeof w !== 'object') return null;
-  return { usedPercent: Number(w.used_percent), windowMinutes: Number(w.window_minutes), resetAt: Number(w.reset_at) };
+  return { usedPercent: Number(w.used_percent), windowMinutes: Number(w.window_minutes), resetAt: Number(w.reset_at), resetAfterSeconds: Number(w.reset_after_seconds) };
 }
 
 /**
@@ -255,6 +277,7 @@ function usageWindow(w) {
     usedPercent: Number(w.used_percent),
     windowMinutes: Number.isFinite(seconds) && seconds > 0 ? seconds / 60 : SEVEN_DAY_MINUTES,
     resetAt: Number(w.reset_at),
+    resetAfterSeconds: Number(w.reset_after_seconds),
   };
 }
 
@@ -332,6 +355,12 @@ const ENTITLEMENT_CODES = new Set(['codex_entitlement_missing', 'codex_workspace
 
 /** The `code`/`type` string of an error body, looking one level into `error`.
  * Fails closed to null on anything that is not JSON or does not carry one. */
+// A refusal whose body names no code but says so in words. Only a 429 is
+// read this way (see classifyCodexRejection): a per-minute throttle says
+// "rate limit", a spent plan says "usage limit" or "quota" or "credits", and
+// upstream has been seen to wrap the latter in an envelope with no code at all.
+const QUOTA_MESSAGE_RE = /usage[ _-]?limit|quota|credits? (?:depleted|exhausted)|plan limit/i;
+
 function errorCode(bodyText) {
   if (!bodyText) return null;
   let body;
@@ -340,7 +369,21 @@ function errorCode(bodyText) {
   const pick = (o) => (o && typeof o === 'object')
     ? [o.code, o.type].find(v => typeof v === 'string' && v) || null
     : null;
-  return pick(body.error) || pick(body);
+  // The envelope varies: `{error:{code}}`, `{error:{error:{code}}}` (wrapped),
+  // `{response:{error:{code}}}` (a failed response), or the code at the top.
+  return pick(body.error) || pick(body.error?.error) || pick(body.response?.error) || pick(body);
+}
+
+function errorMessage(bodyText) {
+  if (!bodyText) return null;
+  let body;
+  try { body = typeof bodyText === 'string' ? JSON.parse(bodyText) : bodyText; } catch { return typeof bodyText === 'string' ? bodyText : null; }
+  if (!body || typeof body !== 'object') return null;
+  for (const o of [body.error, body.error?.error, body.response?.error, body]) {
+    if (o && typeof o === 'object' && typeof o.message === 'string' && o.message) return o.message;
+    if (typeof o === 'string' && o) return o;
+  }
+  return null;
 }
 
 /**
@@ -375,6 +418,8 @@ export function classifyCodexRejection({ status, headers = {}, body = null } = {
   if (status === 400 && ENTITLEMENT_CODES.has(code)) return { ...base, kind: 'entitlement' };
   if (status === 429) {
     if (reachedType || QUOTA_CODES.has(code)) return { ...base, kind: 'quota' };
+    // No code, but the words say a spent plan: still durable, still a rotation.
+    if (!code && QUOTA_MESSAGE_RE.test(errorMessage(body) || '')) return { ...base, code: 'usage_limit_reached', kind: 'quota' };
     return { ...base, kind: 'rate-limit' };
   }
   return { ...base, kind: 'other' };
