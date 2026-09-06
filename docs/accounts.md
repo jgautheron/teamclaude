@@ -93,6 +93,7 @@ An OpenAI Codex subscription can be pooled alongside your Claude accounts.
 
 ```bash
 teamclaude login --codex     # browser sign-in, repeat per account
+teamclaude import --codex    # or copy the Codex CLI's own login (--from <auth.json>)
 ```
 
 Add `--no-browser` to print the URL instead of opening one, and `--name` to
@@ -118,7 +119,15 @@ CODEX_HOME=~/.codex-second codex login
   "importFrom": "~/.codex-second/auth.json" }
 ```
 
-Then tell Codex to reach TeamClaude instead of OpenAI, in `~/.codex/config.toml`:
+`import --codex` warns that an OpenAI refresh token is **single-use**: whichever
+side refreshes first invalidates the other's copy, so a login copied from the
+Codex CLI stops working for the CLI once TeamClaude refreshes it (and vice
+versa). `login --codex` gives TeamClaude a login of its own; the `importFrom`
+form below keeps the Codex CLI as the owner and re-reads its file instead.
+
+Then tell Codex to reach TeamClaude instead of OpenAI. `teamclaude run --codex`
+does this per launch with `-c` overrides and needs nothing below; `teamclaude
+env --codex` prints the same entry for `~/.codex/config.toml`:
 
 ```toml
 model_provider = "teamclaude"
@@ -161,6 +170,11 @@ and one TUI.
   `account_uuid` TeamClaude patches into an Anthropic request body — so the
   Codex path performs no body rewrite at all.
 - Tokens refresh against `auth.openai.com` using the Codex CLI's own client id.
+- `teamclaude accounts` shows the plan and email the login carried, and the
+  ChatGPT account id as the stable `TC_ACCT` pin identity; no profile is fetched.
+- [Keep-warm](quota.md#keep-warm) spawns `codex exec` for a Codex account (with
+  `codexWarmupModel` when set, else Codex's default model), pinned through the
+  same provider override `run --codex` uses.
 - The request body is forwarded untouched. This is a passthrough, not a
   translation layer: TeamClaude never converts between the Anthropic and OpenAI
   protocols.

@@ -120,3 +120,34 @@ test('uninstall of a dedicated fish drop-file removes the file when empty', asyn
     await rm(dir, { recursive: true, force: true });
   }
 });
+
+test('aliasLine for codex routes through run --codex, per shell', () => {
+  assert.equal(aliasLine('bash', 'teamclaude', 'codex'), "alias codex='teamclaude run --codex --'");
+  assert.equal(aliasLine('fish', 'teamclaude', 'codex'), "alias codex 'teamclaude run --codex --'");
+  assert.throws(() => aliasLine('bash', 'teamclaude', 'gemini'), /no alias for "gemini"/);
+});
+
+test('the codex alias installs and uninstalls under its own marker, leaving the claude alias alone', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'tc-alias-codex-'));
+  const rcPath = join(dir, '.bashrc');
+  try {
+    installAlias({ shell: 'bash', rcPath });
+    installAlias({ shell: 'bash', rcPath, tool: 'codex' });
+    let text = await readFile(rcPath, 'utf8');
+    assert.ok(text.includes('# teamclaude alias\nalias claude='));
+    assert.ok(text.includes('# teamclaude codex alias\nalias codex='));
+    assert.ok(text.includes('run --codex --'));
+
+    uninstallAlias({ shell: 'bash', rcPath, tool: 'codex' });
+    text = await readFile(rcPath, 'utf8');
+    assert.ok(!text.includes('alias codex='), 'codex alias removed');
+    assert.ok(text.includes('alias claude='), 'claude alias untouched');
+    assert.ok(text.includes('# teamclaude alias\n'));
+
+    uninstallAlias({ shell: 'bash', rcPath });
+    text = await readFile(rcPath, 'utf8');
+    assert.ok(!text.includes('teamclaude'));
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});

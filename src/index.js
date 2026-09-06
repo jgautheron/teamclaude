@@ -28,7 +28,9 @@ import {
   oauthIdentityFields,
 } from './identity.js';
 import { resolveAccounts } from './resolve-accounts.js';
-import { loginCodex } from './codex-auth.js';
+import { loginCodex, importCodexCredentials, refreshCodexToken, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
+import { buildCodexOverrides, buildCodexConfigToml, codexProviderSettings } from './codex-env.js';
+import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -616,6 +618,7 @@ async function serverCommand() {
     schedule: config.warmupSchedule || null,
     port,
     apiKey: config.proxy?.apiKey,
+    codexModel: config.codexWarmupModel || null,
   });
   warmer.start();
 
@@ -656,6 +659,10 @@ async function serverCommand() {
 
 async function importCommand() {
   const config = await loadOrCreateConfig();
+  if (args.includes('--codex')) {
+    await importCodexCommand(config);
+    return;
+  }
 
   let name = argValue('--name');
   const jsonStr = argValue('--json');
@@ -693,6 +700,74 @@ async function importCommand() {
   await upsertOAuthAccount(config, name, creds, 'import');
 }
 
+/**
+ * `teamclaude import --codex [--from <auth.json>]` — copy the Codex CLI's own
+ * login into the pool, as `import` does for Claude Code's.
+ */
+async function importCodexCommand(config) {
+  const fromPath = argValue('--from') || DEFAULT_CODEX_CREDENTIALS_PATH;
+  let creds;
+  try {
+    creds = await importCodexCredentials(fromPath);
+  } catch (err) {
+    console.error(`Failed to import from ${fromPath}: ${err.message}`);
+    process.exit(1);
+  }
+  if (!creds.accessToken) {
+    console.error(`${fromPath} holds no access token — sign in first with: codex login`);
+    process.exit(1);
+  }
+  await upsertCodexAccount(config, { name: argValue('--name'), source: 'import', creds });
+  // Unlike Anthropic's, an OpenAI refresh token is single-use: whichever side
+  // refreshes first invalidates the other's copy. Say so at import time, when
+  // the user can still choose an arrangement that will not bite later.
+  console.log('');
+  console.log('Note: a Codex refresh token can be used once. When TeamClaude refreshes this login,');
+  console.log(`the copy in ${fromPath} stops working for the Codex CLI (and vice versa).`);
+  console.log('Prefer `teamclaude login --codex` for a login TeamClaude owns, or keep the Codex CLI');
+  console.log('as the owner with an "importFrom" entry in the config so both read the same file.');
+}
+
+/**
+ * Store a Codex login, updating an existing entry for the same ChatGPT
+ * account. Shared by `login --codex` and `import --codex`.
+ */
+async function upsertCodexAccount(config, { name, source, creds }) {
+  const account = {
+    name: name || creds.email
+      || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`,
+    type: 'oauth',
+    provider: 'codex',
+    source,
+    accountId: creds.accountId,
+    email: creds.email || null,
+    planType: creds.planType || null,
+    accessToken: creds.accessToken,
+    refreshToken: creds.refreshToken,
+    expiresAt: creds.expiresAt,
+  };
+
+  // Identity for a Codex account is its ChatGPT account id; fall back to the
+  // display name when upstream did not supply one.
+  const idx = config.accounts.findIndex(a => (
+    a.provider === 'codex' && (
+      (account.accountId && a.accountId === account.accountId) || a.name === account.name
+    )
+  ));
+  if (idx >= 0) {
+    const prev = config.accounts[idx];
+    config.accounts[idx] = { ...prev, ...account, name: prev.name };
+    console.log(`Updated account "${prev.name}"`);
+  } else {
+    config.accounts.push(account);
+    console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
+  }
+
+  await saveConfig(config);
+  console.log(`Saved to ${getConfigPath()}`);
+  await notifyRunningServer(config);
+}
+
 // ── login ───────────────────────────────────────────────────
 
 /**
@@ -719,38 +794,7 @@ async function loginCodexCommand() {
     process.exit(1);
   }
 
-  const name = argValue('--name') || creds.email
-    || `codex-${config.accounts.filter(a => a.provider === 'codex').length + 1}`;
-
-  const account = {
-    name,
-    type: 'oauth',
-    provider: 'codex',
-    source: 'login',
-    accountId: creds.accountId,
-    accessToken: creds.accessToken,
-    refreshToken: creds.refreshToken,
-    expiresAt: creds.expiresAt,
-  };
-
-  // Identity for a Codex account is its ChatGPT account id; fall back to the
-  // display name when upstream did not supply one.
-  const idx = config.accounts.findIndex(a => (
-    a.provider === 'codex' && (
-      (account.accountId && a.accountId === account.accountId) || a.name === account.name
-    )
-  ));
-  if (idx >= 0) {
-    const prev = config.accounts[idx];
-    config.accounts[idx] = { ...prev, ...account, name: prev.name };
-    console.log(`Updated account "${prev.name}"`);
-  } else {
-    config.accounts.push(account);
-    console.log(`Added account "${account.name}"${creds.planType ? ` (${creds.planType})` : ''}`);
-  }
-
-  await saveConfig(config);
-  console.log(`Saved to ${getConfigPath()}`);
+  await upsertCodexAccount(config, { name: argValue('--name'), source: 'login', creds });
 }
 
 async function loginCommand() {
@@ -859,6 +903,10 @@ async function envCommand() {
     process.exit(1);
   }
   const port = config.proxy.port;
+  if (args.includes('--codex')) {
+    await envCodexCommand(config);
+    return;
+  }
   const useMitm = !args.slice(1).includes('--no-mitm');
 
   let caPath = null;
@@ -898,7 +946,85 @@ async function envCommand() {
   }
 }
 
+/**
+ * `teamclaude env --codex` — the provider entry for `~/.codex/config.toml`.
+ *
+ * TOML on stdout, everything else on stderr, so `teamclaude env --codex >>
+ * ~/.codex/config.toml` appends exactly the fragment. The `-c` form `run
+ * --codex` uses is shown too, for a one-off launch without touching the file.
+ */
+async function envCodexCommand(config) {
+  const port = config.proxy.port;
+  const account = (process.env.TC_ACCT || '').trim();
+  const settings = codexProviderSettings({ port, account, holdSeconds: config.holdSeconds });
+  process.stdout.write(`${buildCodexConfigToml(settings).join('\n')}\n`);
+
+  process.stderr.write(`# TeamClaude env: Codex provider for localhost:${port}\n`);
+  if (account) {
+    process.stderr.write(`# pinned to account "${account}" (TC_ACCT)\n`);
+    if (!(config.accounts || []).some(a => a.name === account || a.accountId === account)) {
+      process.stderr.write(`# warning: no account named "${account}" in the config — the proxy will refuse this pin\n`);
+    }
+  }
+  process.stderr.write('# append to ~/.codex/config.toml (replacing any existing model_provider line), or launch once with:\n');
+  process.stderr.write(`#   codex ${buildCodexOverrides(settings).map(a => a.startsWith('-') ? a : `'${a}'`).join(' ')}\n`);
+  if (!(await isProxyUp(port))) {
+    process.stderr.write(`# note: proxy not running on port ${port} — start it with: teamclaude server\n`);
+  }
+  if (config.proxy?.apiKey) {
+    process.stderr.write(`# remote (non-loopback) clients must also send the proxy key: http_headers = { "x-api-key" = "<proxy.apiKey>" }\n`);
+  }
+}
+
 // ── run ─────────────────────────────────────────────────────
+
+/**
+ * `teamclaude run --codex [--auto-fallback] [-- args...]` — launch the Codex
+ * CLI through the proxy, with the same proxy-up guard and pin as `run`.
+ *
+ * The redirect is a set of `-c` overrides rather than an environment, because
+ * a ChatGPT-authenticated Codex ignores `OPENAI_BASE_URL`; they are global
+ * flags, so they go before whatever subcommand the user passes after `--`.
+ */
+async function runCodexCommand(config, { tcFlags, codexArgs }) {
+  const autoFallback = tcFlags.includes('--auto-fallback');
+  const port = config.proxy.port;
+  const env = { ...process.env };
+  // TC_ACCT is teamclaude's own knob and never reaches the child (see run).
+  const tcAcct = (process.env.TC_ACCT || '').trim();
+  delete env.TC_ACCT;
+
+  let overrides = [];
+  if (await isProxyUp(port)) {
+    if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
+    overrides = buildCodexOverrides(codexProviderSettings({ port, account: tcAcct, holdSeconds: config.holdSeconds }));
+  } else if (autoFallback) {
+    console.error(`[TeamClaude] Proxy not running on port ${port} — launching codex directly (--auto-fallback; start it with: teamclaude server)`);
+  } else {
+    console.error(`[TeamClaude] Proxy not running on port ${port}.`);
+    console.error('Start it with: teamclaude server');
+    console.error('Or pass --auto-fallback to launch codex directly (bypassing the proxy) when it is down.');
+    process.exit(1);
+  }
+
+  const result = spawnSync('codex', [...overrides, ...codexArgs], {
+    stdio: 'inherit',
+    shell: process.platform === 'win32',
+    env,
+  });
+
+  if (result.error) {
+    if (result.error.code === 'ENOENT') {
+      console.error('Codex CLI not found in PATH. Install it first: npm install -g @openai/codex');
+    } else {
+      console.error(`Failed to start codex: ${result.error.message}`);
+    }
+    process.exit(1);
+  }
+
+  await autoUpdate({ config }).catch(() => {});
+  process.exit(result.status ?? 1);
+}
 
 async function runCommand() {
   const config = await loadOrCreateConfig();
@@ -915,7 +1041,11 @@ async function runCommand() {
   const autoFallback = tcFlags.includes('--auto-fallback');
   const claudeArgs = sep >= 0
     ? rest.slice(sep + 1)
-    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback');
+    : rest.filter(a => a !== '--mitm' && a !== '--no-mitm' && a !== '--auto-fallback' && a !== '--codex');
+  if (tcFlags.includes('--codex')) {
+    await runCodexCommand(config, { tcFlags, codexArgs: claudeArgs });
+    return;
+  }
 
   // Route through the proxy when it's up. When it's down we refuse by default —
   // silently launching claude directly hides that requests are bypassing the
@@ -1195,7 +1325,9 @@ async function accountsCommand() {
     if (a.type !== 'oauth' || !a.refreshToken) return;
     if (!isTokenExpiringSoon(a.expiresAt)) return;
     try {
-      const newTokens = await refreshAccessToken(a.refreshToken);
+      const newTokens = providerOf(a) === 'codex'
+        ? await refreshCodexToken(a.refreshToken)
+        : await refreshAccessToken(a.refreshToken);
       a.accessToken = newTokens.accessToken;
       a.refreshToken = newTokens.refreshToken;
       a.expiresAt = newTokens.expiresAt;
@@ -1206,10 +1338,11 @@ async function accountsCommand() {
   }));
   if (configDirty) await saveConfig(config);
 
-  // Fetch profiles in parallel for all OAuth accounts
+  // Fetch profiles in parallel for all OAuth accounts. A Codex account has no
+  // Anthropic profile; its identity came with the login (id_token claims).
   const profiles = await Promise.all(
     config.accounts.map(a =>
-      a.type === 'oauth' && a.accessToken ? fetchProfile(a.accessToken) : null
+      a.type === 'oauth' && a.accessToken && providerOf(a) !== 'codex' ? fetchProfile(a.accessToken) : null
     )
   );
 
@@ -1269,6 +1402,17 @@ async function accountsCommand() {
       continue;
     }
 
+    if (providerOf(a) === 'codex') {
+      const plan = a.planType ? ` ${a.planType}` : '';
+      const src = a.source ? `, ${a.source}` : '';
+      console.log(`  [${i + 1}] ${a.name} (Codex${plan}${src})`);
+      if (a.email && a.email !== a.name) console.log(`       Email: ${a.email}`);
+      // The stable pin identity (TC_ACCT): the ChatGPT account id.
+      if (a.accountId) console.log(`       ID:    ${a.accountId}`);
+      if (verbose && a.expiresAt) console.log(`       Token: ${describeExpiry(a.expiresAt)}`);
+      continue;
+    }
+
     // OAuth account
     const hasProfile = p && !p.error;
     const tier = hasProfile ? (p.hasClaudeMax ? 'Max' : p.hasClaudePro ? 'Pro' : 'subscription') : null;
@@ -1279,18 +1423,16 @@ async function accountsCommand() {
     if (hasProfile && p.orgName) console.log(`       Org:   ${p.orgName}`);
     // The stable pin identity (TC_ACCT), unlike the display name above.
     if (a.accountUuid) console.log(`       ID:    ${a.accountUuid}`);
-    if (verbose && a.expiresAt) {
-      const remaining = a.expiresAt - Date.now();
-      if (remaining <= 0) {
-        console.log(`       Token: expired`);
-      } else {
-        const mins = Math.floor(remaining / 60000);
-        const hrs = Math.floor(mins / 60);
-        const expiry = hrs > 0 ? `${hrs}h ${mins % 60}m` : `${mins}m`;
-        console.log(`       Token: expires in ${expiry}`);
-      }
-    }
+    if (verbose && a.expiresAt) console.log(`       Token: ${describeExpiry(a.expiresAt)}`);
   }
+}
+
+function describeExpiry(expiresAt) {
+  const remaining = expiresAt - Date.now();
+  if (remaining <= 0) return 'expired';
+  const mins = Math.floor(remaining / 60000);
+  const hrs = Math.floor(mins / 60);
+  return `expires in ${hrs > 0 ? `${hrs}h ${mins % 60}m` : `${mins}m`}`;
 }
 
 // ── api ─────────────────────────────────────────────────────
@@ -1357,12 +1499,13 @@ async function apiCommand() {
 
 function aliasCommand() {
   const shell = argValue('--shell') || undefined;
+  const tool = args.includes('--codex') ? 'codex' : 'claude';
   if (args.includes('--uninstall')) {
-    alias.uninstallAlias({ shell });
+    alias.uninstallAlias({ shell, tool });
   } else if (args.includes('--install')) {
-    alias.installAlias({ shell });
+    alias.installAlias({ shell, tool });
   } else {
-    alias.printAlias({ shell });
+    alias.printAlias({ shell, tool });
   }
 }
 
@@ -1880,14 +2023,16 @@ Usage: teamclaude [command] [options]
 
 Commands:
   server              Start the proxy server (default; --headless to skip the TUI)
-  import              Import credentials from Claude Code
+  import              Import credentials from Claude Code (--codex [--from
+                      <auth.json>] for the Codex CLI's login)
   login               OAuth login via browser
   login --token       OAuth login via copy/paste (no local callback; for headless/remote)
   login --api         Add an API key account
   env [--no-mitm]     Print export lines to point Claude Code at the proxy, for
                       'eval "$(teamclaude env)"' (MITM forward-proxy by default;
                       --no-mitm for base-URL only). Handy for agent multiplexers
-                      that spawn claude themselves instead of via 'teamclaude run'
+                      that spawn claude themselves instead of via 'teamclaude run'.
+                      --codex prints the ~/.codex/config.toml provider instead
   run [--no-mitm] [--auto-fallback] [-- args...]
                       Run Claude Code through the proxy (errors if it's down,
                       unless --auto-fallback launches claude directly instead).
@@ -1895,8 +2040,12 @@ Commands:
                       even hardcoded api.anthropic.com endpoints are intercepted;
                       --no-mitm uses base-URL routing only. Set TC_ACCT to pin
                       the session to one account (see Environment below)
+  run --codex [--auto-fallback] [-- args...]
+                      Run the Codex CLI through the proxy: the same guard and
+                      TC_ACCT pin, redirected via -c model_provider overrides
   alias               Print a shell alias so plain 'claude' routes via the proxy
-                      (--install to write it to your shell rc; --uninstall to remove)
+                      (--install to write it to your shell rc; --uninstall to remove;
+                      --codex for a 'codex' alias)
   service <sub>       Run the proxy as a user service that starts at login and
                       restarts on its own: install | uninstall | status | print
                       (LaunchAgent on macOS, systemd --user unit on Linux;

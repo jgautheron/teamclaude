@@ -521,6 +521,7 @@ export function resolveAccountPin(accountManager, token) {
   for (const i of [
     qualified,
     at(a => a.accountUuid),
+    at(a => a.accountId), // a Codex account's ChatGPT account id
     at(a => a.orgUuid),
     at(a => a.name),
     at(a => (a.name || '').split(' (')[0]), // display name minus the org suffix

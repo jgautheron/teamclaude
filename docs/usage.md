@@ -136,15 +136,47 @@ teamclaude alias --install    # or write it to your shell rc (--uninstall to rem
 
 This is an interactive-shell alias — it affects `claude` typed at a prompt, not `claude` spawned by editors or scripts. It's a thin passthrough to `teamclaude run`, which holds the proxy-up/down logic (so it errors when the proxy is down; add `--auto-fallback` to launch claude directly instead).
 
+## Run Codex through the proxy
+
+```bash
+teamclaude run --codex                     # interactive Codex
+teamclaude run --codex -- exec "hi"        # anything after -- goes to codex
+```
+
+Same guard as `run`: it errors when the proxy is down unless `--auto-fallback`
+launches `codex` directly. There is no MITM mode here — a ChatGPT-authenticated
+Codex ignores `OPENAI_BASE_URL`, so the redirect is a set of `-c
+model_provider…` overrides passed on the command line, which leave your own
+`~/.codex/config.toml` untouched. The provider sends a fixed bootstrap bearer
+token that the proxy replaces with the selected account's credential, so a
+machine with **no Codex login at all** can run Codex through the pool (verified
+on Codex 0.153.4 with an empty `CODEX_HOME`). `TC_ACCT` pins the session
+exactly as for Claude, by name or by the ChatGPT account id `teamclaude
+accounts` prints; it never reaches the child. `holdSeconds` raises Codex's
+stream idle timeout the way `run` raises `API_TIMEOUT_MS`.
+
+To make it permanent instead, `teamclaude env --codex` prints the provider as
+TOML on stdout (hints on stderr, so `>> ~/.codex/config.toml` appends exactly
+the fragment); `teamclaude alias --codex --install` routes plain `codex`
+through `run --codex` like the `claude` alias. Codex reaches the proxy over a
+WebSocket per turn, relayed with the same rotation as a request — see [Codex
+over WebSocket](proxy-modes.md#codex-over-websocket). A remote (non-loopback)
+Codex must send the proxy key: `http_headers = { "x-api-key" = "<proxy.apiKey>" }`
+in the provider entry.
+
+Add the accounts with `teamclaude login --codex` or `teamclaude import --codex
+[--from <auth.json>]` — see [Codex accounts](accounts.md#codex-accounts-experimental)
+for why `import` warns about the refresh token.
+
 ## Command reference
 
 ```bash
-teamclaude login             # Add an account via OAuth (--api for an API key)
-teamclaude import            # Import credentials from Claude Code
+teamclaude login             # Add an account via OAuth (--api for an API key, --codex for Codex)
+teamclaude import            # Import credentials from Claude Code (--codex from the Codex CLI)
 teamclaude server            # Start the proxy (--headless for plain logs)
-teamclaude run               # Run Claude Code through the proxy
-teamclaude env               # Print export lines for routing claude yourself
-teamclaude alias             # Print/install a `claude` alias that routes via the proxy
+teamclaude run               # Run Claude Code through the proxy (--codex for Codex)
+teamclaude env               # Print export lines for routing claude yourself (--codex: TOML provider)
+teamclaude alias             # Print/install a `claude` alias that routes via the proxy (--codex: `codex`)
 teamclaude accounts          # List accounts with subscription tier and token status
 teamclaude status            # Show live proxy status (requires running server)
 teamclaude attach            # Open the live dashboard against a running server
