@@ -37,6 +37,8 @@ A Codex account does not send the `unified-*-status` headers, so its refusals ar
 - A **403 naming a model or workspace entitlement** (`codex_entitlement_missing`, `codex_workspace_access_denied`) cools the account down for five minutes like an OAuth policy denial below, and fails over. Shared quota is untouched.
 - Any **other 429** is the per-minute throttle and takes the rate-limit path: pause, one failover hop, inline wait. Never a rotation.
 
+The same classes apply to a refused WebSocket handshake, with the outcomes described under [Codex over WebSocket](proxy-modes.md#codex-over-websocket).
+
 ## OAuth entitlement denials
 
 A `403` whose structured error code is `error.details.error_code: oauth_not_allowed_for_organization` means the selected account's organization does not permit OAuth authentication. TeamClaude fails the current request over to another account and keeps the denied account out of automatic rotation for five minutes. The cooldown is shared by later requests, is not persisted, and expires automatically so an organization policy change can recover without restarting the proxy. Other `403` responses still fail over for that request but do not quarantine the account.

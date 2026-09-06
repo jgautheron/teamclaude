@@ -127,7 +127,14 @@ model_provider = "teamclaude"
 name = "teamclaude"
 base_url = "http://127.0.0.1:3456/backend-api/codex"
 wire_api = "responses"
+supports_websockets = true
 ```
+
+`supports_websockets = true` keeps Codex on the WebSocket transport it uses
+against OpenAI directly (a custom provider defaults to `false`); TeamClaude
+relays it with the same rotation as a request — see [Codex over
+WebSocket](proxy-modes.md#codex-over-websocket). Leave it out to have Codex
+`POST` each response over SSE instead; both work.
 
 `OPENAI_BASE_URL` does **not** work for this — a ChatGPT-authenticated Codex
 ignores it. `model_providers` is the supported redirect.

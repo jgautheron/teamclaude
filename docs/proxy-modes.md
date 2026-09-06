@@ -39,6 +39,60 @@ curl --proxy http://localhost:3456 --cacert ~/.config/teamclaude-ca.pem https://
 # → {"teamclaude":"mitm-proxy-ok","host":"www.example.org",...}
 ```
 
+## Codex over WebSocket
+
+Codex CLI 0.133+ speaks the Responses API over a **WebSocket** to
+`chatgpt.com/backend-api/codex/responses` whenever its provider has
+`supports_websockets = true` (see the [Codex config snippet](accounts.md#codex-accounts-experimental)),
+and only falls back to `POST` + SSE on a `426`. One connection carries one
+turn: Codex opens it lazily, may send a prewarm `response.create` first, and
+reuses it for the turn's follow-up requests with `previous_response_id`. So a
+connection is bound to **one** account for its lifetime, and the account can
+only change between connections.
+
+TeamClaude relays that connection rather than splicing it blind:
+
+- The client's handshake is **answered locally** at once. Codex sends nothing
+  until it has the `101`, so the first frame — the `response.create` naming the
+  **model** — arrives a moment later, and only then is the upstream dialed.
+  Account selection is therefore model-aware, exactly as for a request: an
+  account whose Spark family is spent still serves `gpt-5.4` over WebSocket.
+- The upstream handshake carries the selected account's credential
+  (`Authorization: Bearer` + `ChatGPT-Account-Id`); the client's proxy key never
+  leaves the machine, `permessage-deflate` is not offered upstream (the relay
+  reads frames, so they must stay uncompressed), and `openai-beta:
+  responses_websockets=…` is added if a bare client omits it.
+- After that, bytes are **passed through untouched** in both directions. A
+  passive decoder reads alongside: the `codex.rate_limits` event that opens
+  every response feeds the [quota model](quota.md#codex-windows), so the bars
+  and rotation stay honest with no extra spend.
+- A **refused handshake** is classified like a refused request ([Codex
+  refusals](routing.md#codex-refusals)): a spent window or an entitlement
+  denial marks the account and the relay **redials on another** — the client
+  never sees it; a `401` forces one token refresh and a redial; a per-minute
+  rate limit closes the client with `1013` and the `retry-after` in the reason,
+  so Codex's own retry comes back; anything else closes with `1011` naming the
+  upstream status.
+- An account that becomes **ineligible mid-connection** — a `usage_limit_reached`
+  error event, or a `codex.rate_limits` reading over the switch threshold — is
+  never swapped under a response in flight (`previous_response_id` binds the
+  connection to it). The relay lets the response finish and then closes the
+  client with `1012`; Codex reconnects with its full input, and the new
+  connection is routed afresh. Verified live: a turn closed after every
+  response reconnected each time and finished correctly.
+- A [`TC_ACCT` pin](routing.md#pin-a-session-to-one-account) is hard here
+  too: the pinned account or a close, never another account. A pin naming no
+  account is refused with `404` before any upstream is touched.
+
+The upgrade is gated exactly like a request — the proxy key for a non-loopback
+caller, a browser `Origin` refused with `403` — because unlike the Remote
+Control passthrough it injects a credential. Anthropic upgrades (`/v1/code/*`)
+are untouched by all of this and keep their byte-for-byte passthrough.
+
+Each connection is one row in the activity log: `WS /backend-api/codex/responses
+(model) → account`, with the duration to close. An upstream that does not
+complete the handshake within 30 s is given up on with `1011`.
+
 ## Upstream proxy
 
 For a host that has **no direct route to the internet** — the corporate case, where
