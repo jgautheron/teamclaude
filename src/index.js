@@ -30,8 +30,8 @@ import {
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, importCodexCredentials, refreshCodexToken, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
 import { buildCodexOverrides, buildCodexConfigToml, codexProviderSettings } from './codex-env.js';
-import { translateCodexResume } from './codex-sessions.js';
-import { providerOf } from './provider.js';
+import { translateCodexResume, displaySessionId } from './codex-sessions.js';
+import { providerOf, providerForPath } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -489,10 +489,13 @@ async function serverCommand() {
       const dur = r ? ((Date.now() - r.started) / 1000).toFixed(1) : '?';
       const acct = info.account || r?.account || '?';
       const model = info.model ? ` (${info.model})` : '';
-      const sid = info.sessionId ? `${info.sessionId.slice(0, 6)} ` : '';
+      // The id as the user knows it, and the tool the row belongs to; a
+      // plain word rather than the TUI's glyph, since this line is for files.
+      const sid = info.sessionId ? `${displaySessionId(info.sessionId).slice(0, 6)} ` : '';
+      const tool = providerForPath(info.path || '') === 'codex' ? 'codex ' : '';
       const client = (info.client || r?.client) ? `[${info.client || r.client}] ` : '';
       const pin = (info.pinned || r?.pinned) ? ' [pin]' : '';
-      writeActivity(`${client}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+      writeActivity(`${client}${tool}${sid}${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     };
     // Tee console output to the activity log as well
     const origLog = console.log;

@@ -16,6 +16,21 @@ import { join } from 'node:path';
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
+// The proxy keys a Codex session as `codex:<id>` so it can never collide with
+// a Claude Code session id in the tracker. That namespace is internal: a row
+// shows the id Codex printed, and looks the name up in Codex's own index.
+export const CODEX_SESSION_PREFIX = 'codex:';
+
+/** Whether a tracker session id names a Codex session. */
+export function isCodexSessionId(sid) {
+  return typeof sid === 'string' && sid.startsWith(CODEX_SESSION_PREFIX);
+}
+
+/** The id as the user knows it: without the proxy's namespace. */
+export function displaySessionId(sid) {
+  return isCodexSessionId(sid) ? sid.slice(CODEX_SESSION_PREFIX.length) : sid;
+}
+
 export function defaultCodexHome(env = process.env) {
   return env.CODEX_HOME || join(homedir(), '.codex');
 }
@@ -39,6 +54,27 @@ export async function resolveCodexSessionName(name, { home = defaultCodexHome() 
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
     if (entry && entry.thread_name === name && typeof entry.id === 'string') found = entry.id;
+  }
+  return found;
+}
+
+/**
+ * The name Codex holds for session `id` in its index, or null. The mirror of
+ * resolveCodexSessionName: later lines win, so a rename shows its latest name.
+ */
+export async function codexSessionTitle(id, { home = defaultCodexHome() } = {}) {
+  let text;
+  try {
+    text = await readFile(join(home, 'session_index.jsonl'), 'utf8');
+  } catch {
+    return null;
+  }
+  let found = null;
+  for (const line of text.split('\n')) {
+    if (!line.trim()) continue;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry && entry.id === id && typeof entry.thread_name === 'string' && entry.thread_name.trim()) found = entry.thread_name.trim();
   }
   return found;
 }

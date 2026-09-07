@@ -17,6 +17,7 @@
  */
 
 import { readdir, readFile, open } from 'node:fs/promises';
+import { codexSessionTitle, displaySessionId, isCodexSessionId, defaultCodexHome } from './codex-sessions.js';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { SESSION_KNOWN_TTL_MS } from './session-tracker.js';
@@ -72,8 +73,12 @@ export class SessionTitles {
    *  reads the transcripts of every session the proxy sees, which is further
    *  than the proxy reaches for anything else by default. */
   configure(cfg) {
-    const { enabled = false, width = DEFAULT_WIDTH, projectsDir = DEFAULT_PROJECTS_DIR } = cfg || {};
+    const { enabled = false, width = DEFAULT_WIDTH, projectsDir = DEFAULT_PROJECTS_DIR, codexHome = defaultCodexHome() } = cfg || {};
     this.enabled = enabled === true;
+    // Codex names its threads in `$CODEX_HOME/session_index.jsonl`; a Codex
+    // session's title comes from there rather than from Claude's transcripts.
+    if (codexHome !== this.codexHome) this.cache.clear();
+    this.codexHome = codexHome;
     // A label narrower than the short id it falls back to would cut the id.
     this.width = Math.max(SHORT_ID_LEN, Math.trunc(width) || DEFAULT_WIDTH);
     // Titles cached from one directory say nothing about another.
@@ -142,6 +147,7 @@ export class SessionTitles {
   /** The project directory is keyed by the session's cwd, which the proxy does
    *  not know, so each directory is tried until one holds the session. */
   async _read(sessionId) {
+    if (isCodexSessionId(sessionId)) return cleanTitle(await codexSessionTitle(displaySessionId(sessionId), { home: this.codexHome }));
     const entries = await readdir(this.projectsDir, { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
       if (!entry.isDirectory()) continue;
@@ -209,7 +215,7 @@ function lastTitle(lines) {
 }
 
 function isSessionId(value) {
-  return typeof value === 'string' && SESSION_ID.test(value);
+  return typeof value === 'string' && SESSION_ID.test(displaySessionId(value));
 }
 
 /** A title is printed inside a terminal escape and written to the activity log

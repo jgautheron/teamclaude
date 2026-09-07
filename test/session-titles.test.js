@@ -480,3 +480,17 @@ test('settings: the toggle keeps the configured width and projects directory', a
   assert.equal(titles.projectsDir, '/nonexistent-projects');
   assert.deepEqual(saved.at(-1), { enabled: true, width: 24, projectsDir: '/nonexistent-projects' });
 });
+
+test('a Codex session is named from Codex\'s own index, by the id behind the proxy\'s namespace', async () => {
+  const home = await mkdtemp(join(tmpdir(), 'tc-codex-home-'));
+  const id = '01a06929-e126-78b2-873c-08efff8ce0ca';
+  await writeFile(join(home, 'session_index.jsonl'), [
+    JSON.stringify({ id, thread_name: 'implement proper support for stacks', updated_at: '2026-09-03T21:29:07Z' }),
+    JSON.stringify({ id, thread_name: 'stacks', updated_at: '2026-09-03T21:55:40Z' }),
+  ].join('\n') + '\n');
+  const titles = new SessionTitles({ enabled: true, projectsDir: join(home, 'none'), codexHome: home });
+  assert.equal(await titles.resolve(`codex:${id}`), 'stacks', 'the latest name wins');
+  assert.equal(titles.get(`codex:${id}`), 'stacks', 'and is cached for the render path');
+  assert.equal(await titles.resolve('codex:ffffffff-0000-4000-8000-000000000000'), null);
+  assert.equal(await titles.resolve('codex:not-an-id'), null, 'only a real id is looked up');
+});

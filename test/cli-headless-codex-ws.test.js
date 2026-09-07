@@ -112,7 +112,7 @@ test('a headless server logs a Codex WebSocket session as one activity row', asy
       await new Promise(r => setTimeout(r, 100));
       log = await readFile(logPath, 'utf8').catch(() => '');
     }
-    assert.match(log, /codex: WS \/backend-api\/codex\/responses \(gpt-5\.4\) → a \(200, [\d.]+s\)/, `activity log:\n${log}\nserver output:\n${output}`);
+    assert.match(log, /codex sess-4 WS \/backend-api\/codex\/responses \(gpt-5\.4\) → a \(200, [\d.]+s\)/, `activity log:\n${log}\nserver output:\n${output}`);
   } finally {
     child.kill('SIGTERM');
     await new Promise(r => child.once('exit', r));
