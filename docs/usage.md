@@ -33,6 +33,20 @@ The name comes from Claude Code's own files under `~/.claude/projects`, in this 
 A session with none of these keeps the first six hex characters of its id. So does a request that carries no
 session header: a bare SDK or API client reaches the proxy anonymously, and no file names it.
 
+A Codex row is marked with a green `◆` in the column before the session label, and its label is the session
+id Codex prints at exit (`codex resume <id>`), shortened the same way. With titles enabled the name comes from
+Codex's own index, `$CODEX_HOME/session_index.jsonl` (override with `sessionTitles.codexHome`), so a thread
+Codex named `stacks` shows as `stacks`:
+
+```
+ ⠋ 00:24:54 ◆ stacks             WS /backend-api/codex/responses (gpt-5.6-sol) → jon@phantom.com (5.0s...)
+ ⠋ 00:24:56   bcff75             POST /v1/messages?beta=true (claude-opus-5) → jonagent@phantom.com (3.7s...)
+```
+
+The headless activity log writes the word `codex` in place of the mark. The path is the one Codex itself
+uses under a ChatGPT login — `chatgpt.com/backend-api/codex/responses`, not `api.openai.com/v1/responses` —
+and the proxy keeps it so the request can be told apart from a Claude one by its path alone.
+
 Each label is read once and re-read at most every 30 seconds, off the render path, so a `/rename` reaches the
 log without a restart and no frame waits on the disk. Only a session id shaped like a UUID is looked up, and a
 title is printed with its control characters removed, since both arrive from outside the proxy.
