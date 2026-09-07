@@ -1,6 +1,7 @@
 import { createWriteStream } from 'node:fs';
 import { gatingUtilization, codexBucketEntries, codexGatingUtilization } from './model.js';
-import { providerOf } from './provider.js';
+import { providerOf, providerForPath } from './provider.js';
+import { displaySessionId } from './codex-sessions.js';
 import { importCredentials, fetchProfile } from './oauth.js';
 import {
   sameIdentity,
@@ -80,8 +81,15 @@ function sessionColorCode(sid) {
 // no session (e.g. a telemetry request). One width for every row, named or not,
 // keeps the columns after it aligned. Measured in display columns, not UTF-16
 // units, so a CJK title takes the same room as an ASCII one.
+// The id shown is the one the user knows (a Codex session's `codex:` namespace
+// is the proxy's own); the color still keys on the full id, so a Claude and a
+// Codex session can never share one by accident.
 const sessionTag = (sid, title = null, width = SESSION_ID_LEN) =>
-  sid ? fg(sessionColorCode(sid), rpad(truncate(title || sid.slice(0, SESSION_ID_LEN), width), width)) : ' '.repeat(width);
+  sid ? fg(sessionColorCode(sid), rpad(truncate(title || displaySessionId(sid).slice(0, SESSION_ID_LEN), width), width)) : ' '.repeat(width);
+// One column that says which tool a row belongs to: Codex rows carry a mark,
+// Claude rows (the default provider) none, as the accounts table marks the
+// current account and leaves the rest blank.
+const providerMark = (path) => (providerForPath(path || '') === 'codex' ? green('◆') : ' ');
 
 // Which quota-family bar (F7/S7) a route binds to, or null for a general route.
 // Auto routes are named 'fable'/'sonnet'; a configured route is classified by its
@@ -564,7 +572,7 @@ export class TUI {
     const model = info.model ? ` (${info.model})` : ''; // shown when the request named a model
     const sid = info.sessionId || r?.sessionId || null;
     const pin = (info.pinned || r?.pinned) ? dim(' [pin]') : '';
-    this._addLog(`${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
+    this._addLog(`${providerMark(info.path)} ${this._sessionTag(sid)} ${info.method} ${info.path}${model} → ${acct}${pin} (${info.status}, ${dur}s)`);
     if (this.active.size === 0) this._retick();   // animating → idle
   }
 
@@ -1424,7 +1432,7 @@ export class TUI {
       const m = r.model ? dim(` (${r.model})`) : ''; // filled in as soon as the model is peeked from the stream
       const pin = r.pinned ? dim(' [pin]') : '';
       const a = r.account ? ` → ${r.account}${pin}` : '';
-      lines.push(` ${sp} ${gray(r.t)}  ${this._sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
+      lines.push(` ${sp} ${gray(r.t)}  ${providerMark(r.path)} ${this._sessionTag(r.sessionId)} ${r.method} ${r.path}${m}${a} ${dim(`(${el}s...)`)}`);
     }
 
     // Completed log
