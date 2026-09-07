@@ -1528,10 +1528,17 @@ export class TUI {
     // tag on two families, plus route cells) leave less than BAR_MIN per bar,
     // and the floor below then overrode the budget: two accounts blocked on both
     // families drew 72 columns at W=70, which fitLine silently cut (#234).
+    // A Codex plan need not meter a short window at all — Pro reports one
+    // 7-day window (the Spark family carries its own), Go/Free a 30-day one.
+    // A list where no row could ever fill the `Ses` bar does not draw it: the
+    // weekly (or monthly) bar takes the first slot, and the family bars follow.
+    // Claude rows always have the 5h bucket, so a mixed list keeps the column.
+    const shortBar = accts.some(a => providerOf(a) !== 'codex' || a.quota.unified5h != null);
     const showBoth = W >= (compact ? 62 : 70) && roomFor(2);
+    const sharedBars = shortBar ? (showBoth ? 2 : 1) : 1;
     const familyBars = (anyFable ? 1 : 0) + (anySonnet ? 1 : 0) + codexFams.length;
-    const showFamily = showBoth && familyBars > 0 && roomFor(2 + familyBars);
-    const nbars = (showBoth ? 2 : 1) + (showFamily ? familyBars : 0);
+    const showFamily = (shortBar ? showBoth : true) && familyBars > 0 && roomFor(sharedBars + familyBars);
+    const nbars = sharedBars + (showFamily ? familyBars : 0);
     // Backstop for the case no count of bars can fix: when even one bar at
     // BAR_MIN overruns the row, the floor has to yield. A narrow bar reads
     // worse than a wide one; a row cut mid-bar loses the reset countdown its
@@ -1558,11 +1565,11 @@ export class TUI {
       fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
       sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
     };
-    return { bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW, codexFams, compact, now };
+    return { bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW, codexFams, compact, now, shortBar };
   }
 
   _renderAcctWith(idx, L) {
-    return this._renderAcct(idx, L.bw, L.showBoth, L.routes, L.genRoutes, L.familyTarget, L.showFamily, L.nameW, L.codexFams, { compact: L.compact, now: L.now });
+    return this._renderAcct(idx, L.bw, L.showBoth, L.routes, L.genRoutes, L.familyTarget, L.showFamily, L.nameW, L.codexFams, { compact: L.compact, now: L.now, shortBar: L.shortBar });
   }
 
   /**
@@ -1579,7 +1586,7 @@ export class TUI {
     return this.am.previewProviderIndex?.(provider) === idx;
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, codexFams = null, { compact = false, now = Date.now() } = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, codexFams = null, { compact = false, now = Date.now(), shortBar = true } = {}) {
     const a = this.am.accounts[idx];
     const isCur = this._isCurrentAccount(idx);
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1643,7 +1650,10 @@ export class TUI {
     let r1 = null, r2 = null, l1 = 'Ses', l2 = 'Wk ', t1 = null, t2 = null, w1 = null, w2 = null;
     let k1 = 'tokens', k2 = 'requests';
 
-    if (q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null || q.unified30d != null) {
+    // An OAuth account meters subscription windows even before its first
+    // reading arrives (a throttled Codex account that never answered, say);
+    // the token/request bars belong to API-key accounts only.
+    if (a.type === 'oauth' || q.unified5h != null || q.unified7d != null || q.unified7dSonnet != null || q.unified7dFable != null || q.unified30d != null) {
       r1 = q.unified5h;
       r2 = q.unified7d;
       t1 = q.unified5hReset;
@@ -1688,12 +1698,18 @@ export class TUI {
       const th = thFor(k);
       return cap == null ? th : (typeof th === 'number' ? Math.min(th, cap) : cap);
     };
-    const th1 = limFor(k1);
+    let th1 = limFor(k1);
     const th2 = limFor(k2);
 
+    // A list with no short window to draw (see _listLayout) starts the row at
+    // the weekly/monthly bar; the family bars still follow it.
+    if (!shortBar && providerOf(a) === 'codex') {
+      [r1, l1, t1, w1] = [r2, l2, t2, w2];
+      th1 = th2;
+    }
     let line = ` ${sel}${cur} ${startSlot}${name} ${type}${status} ${l1} ${bar(r1, bw, t1, w1, th1)}`;
-    if (showBoth) {
-      line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
+    if (showBoth && shortBar) line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
+    if (showBoth || !shortBar) {
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
       const claudeRow = providerOf(a) !== 'codex';

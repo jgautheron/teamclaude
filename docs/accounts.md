@@ -171,6 +171,17 @@ api.responses.write`. Codex appends `/responses` and `/models` to `base_url`,
 so this suffix makes it emit exactly the paths the ChatGPT backend expects and
 TeamClaude forwards them verbatim.
 
+### What the Codex pane draws
+
+A Codex row has the same bars as a Claude row where the plan reports the
+window: `Ses` for a short (5h) window, `Wk` for the weekly one, `Mo` for the
+30-day window a Go/Free plan meters instead, then one bar per model family the
+account reports (`Sp7` for GPT-5.3-Codex-Spark's weekly). Pro plans report no
+short window at all — only the weekly, plus the Spark family's own 5h and
+weekly — so a Codex list where no account reports one drops the `Ses` column
+and starts at `Wk`; it comes back the moment an account (a Plus or Team plan)
+reports a 5h window. A single mixed column keeps `Ses` for the Claude rows.
+
 ### How it shares the port with Claude
 
 One listener serves both CLIs, because the request path says which pool of
