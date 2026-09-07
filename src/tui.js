@@ -1510,8 +1510,11 @@ export class TUI {
       return tag ? Math.max(w, 2 + vw(tag)) : w;
     }, 0);
     // And for the `↻ 12m` hold countdown on a throttled or paused account.
+    // One clock reading for the layout and the rows it sizes: a countdown
+    // that ticks from `1h` to `59m` between the two would be a column wide.
+    const now = Date.now();
     const holdW = accts.reduce((w, a) => {
-      const tag = holdTag(a);
+      const tag = holdTag(a, now);
       return tag ? Math.max(w, 2 + vw(tag)) : w;
     }, 0);
     const fixed = (compact ? 20 : 28) + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW + holdW;
@@ -1555,11 +1558,11 @@ export class TUI {
       fable: anyFable ? this.am.previewRouteIndex('claude-fable-5') : null,
       sonnet: anySonnet ? this.am.previewRouteIndex('claude-sonnet-4-6') : null,
     };
-    return { bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW, codexFams, compact };
+    return { bw, showBoth, routes, genRoutes, familyTarget, showFamily, nameW, codexFams, compact, now };
   }
 
   _renderAcctWith(idx, L) {
-    return this._renderAcct(idx, L.bw, L.showBoth, L.routes, L.genRoutes, L.familyTarget, L.showFamily, L.nameW, L.codexFams, { compact: L.compact });
+    return this._renderAcct(idx, L.bw, L.showBoth, L.routes, L.genRoutes, L.familyTarget, L.showFamily, L.nameW, L.codexFams, { compact: L.compact, now: L.now });
   }
 
   /**
@@ -1576,7 +1579,7 @@ export class TUI {
     return this.am.previewProviderIndex?.(provider) === idx;
   }
 
-  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, codexFams = null, { compact = false } = {}) {
+  _renderAcct(idx, bw, showBoth, routes = this.am.getRoutes(), genRoutes = routes.filter(r => routeFamily(r) === null), familyTarget = {}, showFamily = true, nameW = NAME_MIN, codexFams = null, { compact = false, now = Date.now() } = {}) {
     const a = this.am.accounts[idx];
     const isCur = this._isCurrentAccount(idx);
     const isSel = this.mode === 'select' && idx === this.selIdx;
@@ -1727,7 +1730,7 @@ export class TUI {
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     // When a throttled or paused account is tried again, so "throttled" is a
     // countdown rather than a verdict.
-    const hold = holdTag(a);
+    const hold = holdTag(a, now);
     if (hold) line += `  ${yellow(hold)}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.
