@@ -78,10 +78,11 @@ const STRIP_UPSTREAM = new Set([
 const EVENT_QUOTA_CODES = new Set(['usage_limit_reached', 'usage_limit_exceeded', 'usage_not_included', 'rate_limit_reached']);
 // Events that end a response, after which the connection may be rotated away.
 const TERMINAL_EVENTS = new Set(['response.completed', 'response.failed', 'response.incomplete', 'error']);
-// Events that open a response without committing any of its output. While
-// only these have arrived the response can still be retried elsewhere; the
-// first event outside this set commits the response to this account.
-const PREAMBLE_EVENTS = new Set(['codex.rate_limits', 'codex.response.metadata']);
+// Events that open a response without committing any of its output — a
+// `response.created` says the request was accepted, not that anything came
+// of it. While only these have arrived the response can still be retried
+// elsewhere; the first event outside this set commits it to this account.
+const PREAMBLE_EVENTS = new Set(['codex.rate_limits', 'codex.response.metadata', 'response.created', 'response.in_progress']);
 // How much of a response's preamble is held back before it is forwarded
 // regardless — a bound on memory, far above what a preamble carries.
 const HELD_LIMIT = 4 * 1024 * 1024;
@@ -604,8 +605,8 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
       state.inResponse = true;
       return;
     }
+    if (type === 'response.created') state.inResponse = true;
     if (PREAMBLE_EVENTS.has(type)) return;
-    if (type === 'response.created') { state.inResponse = true; flushHeld(); return; }
 
     if (type === 'error' || type === 'response.failed') {
       let code = null;
