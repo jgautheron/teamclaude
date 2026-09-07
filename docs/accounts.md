@@ -188,6 +188,16 @@ list is one column again, Claude first, with `codex` in the type column.
 
 ### What differs from a Claude account
 
+A Codex account is identified by its **ChatGPT account id**, never by an
+Anthropic account/org UUID, and never by name across providers: one person's
+Claude and Codex logins share an email and so a display name, and the two
+entries are still two accounts — saved quota is restored to each on its own,
+`login --codex` never updates the Claude namesake, and a `TC_ACCT` pin by that
+name resolves within the provider the request is for (a Codex path gets the
+Codex account). Sonnet and Fable buckets are never restored onto or drawn for
+a Codex row.
+
+
 - The credential is injected as `Authorization: Bearer`, plus a
   `ChatGPT-Account-Id` header. That header is OpenAI's counterpart to the
   `account_uuid` TeamClaude patches into an Anthropic request body — so the

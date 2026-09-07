@@ -213,10 +213,12 @@ export function spendTag(quota) {
   return (spend.usedMinor || 0) > 0 ? '$!' : '$';
 }
 
-export function blockedFamilies(quota, threshold) {
+export function blockedFamilies(quota, threshold, { provider = 'anthropic' } = {}) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
-  for (const [label, key] of [['Sonnet', 'unified7dSonnet'], ['Fable', 'unified7dFable']]) {
+  // Sonnet and Fable are Anthropic families; a Codex account has its own below.
+  const claudeFamilies = provider === 'codex' ? [] : [['Sonnet', 'unified7dSonnet'], ['Fable', 'unified7dFable']];
+  for (const [label, key] of claudeFamilies) {
     if (quota[key] == null) continue;      // family not metered separately here
     // Compared against gatingUtilization — the value the ROUTER gates on — not
     // against the family bucket alone. Family spend meters into the shared
@@ -1465,8 +1467,8 @@ export class TUI {
     // column each at the row start so the marker's position identifies the route.
     const routes = this.am.getRoutes();
     const genRoutes = routes.filter(r => routeFamily(r) === null);
-    const anyFable = accts.some(a => a.quota.unified7dFable != null);
-    const anySonnet = accts.some(a => a.quota.unified7dSonnet != null);
+    const anyFable = accts.some(a => providerOf(a) !== 'codex' && a.quota.unified7dFable != null);
+    const anySonnet = accts.some(a => providerOf(a) !== 'codex' && a.quota.unified7dSonnet != null);
     // Codex model buckets get a bar each, list-wide, so the column a family
     // occupies is the same on every row that has it.
     const codexFams = [...new Set(accts.flatMap(a => codexBucketEntries(a.quota).map(e => e.slug)))].sort();
@@ -1475,7 +1477,7 @@ export class TUI {
     // actually blocked; the common case where nothing is spends those columns
     // on the bars instead of leaving the row short of the edge.
     const tagW = accts.reduce((w, a) => {
-      const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key));
+      const names = blockedFamilies(a.quota, key => this.am.thresholdFor(key), { provider: providerOf(a) });
       return names.length ? Math.max(w, 4 + vw(names.join(' '))) : w;
     }, 0);
     // Same rule for the `$`/`$!` money tag: a column the row can draw is a
@@ -1664,11 +1666,12 @@ export class TUI {
       line += `  ${l2} ${bar(r2, bw, t2, w2, th2)}`;
       // Sonnet weekly bar — only shown when the usage probe has populated it. A
       // leading ► (in place of a padding space) marks a Sonnet route on this account.
-      if (showFamily && q.unified7dSonnet != null) {
+      const claudeRow = providerOf(a) !== 'codex';
+      if (showFamily && claudeRow && q.unified7dSonnet != null) {
         line += ` ${familyMark('sonnet')}S7  ${bar(q.unified7dSonnet, bw, q.unified7dSonnetReset, SEVEN_DAY_MS, limFor('unified7dSonnet'))}`;
       }
       // Fable weekly bar — only shown when the usage probe has populated it.
-      if (showFamily && q.unified7dFable != null) {
+      if (showFamily && claudeRow && q.unified7dFable != null) {
         line += ` ${familyMark('fable')}F7  ${bar(q.unified7dFable, bw, q.unified7dFableReset, SEVEN_DAY_MS, limFor('unified7dFable'))}`;
       }
       // Codex model buckets, one bar per family the fleet knows, in a fixed
@@ -1693,7 +1696,7 @@ export class TUI {
     // limFor, not thresholdFor: it is min(per-bucket threshold, per-account cap),
     // so the tag covers both ceilings and still judges each family against its
     // OWN configured threshold.
-    const blocked = blockedFamilies(q, limFor);
+    const blocked = blockedFamilies(q, limFor, { provider: providerOf(a) });
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.

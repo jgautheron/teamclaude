@@ -461,7 +461,7 @@ export function codexUpgradeTarget(accountManager, url) {
       if (providerForPath(candidate) !== 'codex') return null;
       let token = null;
       try { token = decodeURIComponent(after.slice(0, end)); } catch { token = null; }
-      pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
+      pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token, 'codex');
       if (pinnedIndex == null) return { unknownPin: token ?? after.slice(0, end) };
       path = candidate;
     }
@@ -523,14 +523,19 @@ async function readControlBody(req, limit = 64 * 1024) {
  * deleting an account would silently repoint every later pin at a DIFFERENT
  * account — a wrong-account misroute rather than an honest failure.
  */
-export function resolveAccountPin(accountManager, token) {
+export function resolveAccountPin(accountManager, token, provider = null) {
   const accounts = accountManager.accounts || [];
   const norm = (s) => (s || '').trim().toLowerCase();
   const t = norm(token);
   if (!t) return null;
 
-  const at = (pick) => accounts.findIndex(a => norm(pick(a)) === t);
-  const qualified = accounts.findIndex(a => a.accountUuid && a.orgUuid
+  // One person's Claude and Codex logins share a display name, and a pin is
+  // usually that name. The request says which provider it is for, so only
+  // that provider's accounts are candidates; the index is still into the
+  // full list.
+  const eligible = (a) => provider == null || providerOf(a) === provider;
+  const at = (pick) => accounts.findIndex(a => eligible(a) && norm(pick(a)) === t);
+  const qualified = accounts.findIndex(a => eligible(a) && a.accountUuid && a.orgUuid
     && `${norm(a.accountUuid)}/${norm(a.orgUuid)}` === t);
 
   for (const i of [
@@ -719,7 +724,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
         const raw = afterPrefix.slice(0, tokenEnd);
         let token = null;
         try { token = decodeURIComponent(raw); } catch { token = null; }
-        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token);
+        pinnedIndex = token == null ? null : resolveAccountPin(accountManager, token, providerForPath(afterPrefix.slice(tokenEnd)));
         if (pinnedIndex == null) {
           // Client-supplied and already percent-decoded, so this is the one
           // value on the path that can carry raw control bytes.
@@ -741,7 +746,7 @@ export function createProxyRequestListener({ accountManager, upstream, logDir = 
       // than at CONNECT time: a hot reload can renumber accounts while a tunnel
       // is open, and a name outliving an index is the safer half of that race.
       if (pinnedIndex == null && forcedPin != null) {
-        pinnedIndex = resolveAccountPin(accountManager, forcedPin);
+        pinnedIndex = resolveAccountPin(accountManager, forcedPin, providerForPath(req.url));
         if (pinnedIndex == null) {
           const reqId = ++counter;
           const sessionId = sessionIdOf(req);

@@ -10,6 +10,14 @@
 // The org discriminator prefers the org UUID but falls back to the org name
 // (the profile endpoint has always returned a name), so identity still works on
 // entries created before org UUIDs were stored.
+//
+// A Codex account is a different kind of record: it carries the ChatGPT account
+// id, never an Anthropic UUID or org. And one person's Claude and Codex logins
+// share an email, so they share a display name — the name fallback below would
+// have called them one account, and everything keyed on identity (saved quota,
+// login upserts, removals) would have crossed the two. So the provider is
+// compared first, and a Codex pair is compared on its own id.
+import { providerOf } from './provider.js';
 
 /** Stable org discriminator for an account record: org UUID, else org name, else null. */
 export function orgKey(acct) {
@@ -27,6 +35,11 @@ export function orgKey(acct) {
  * - Otherwise (API-key accounts, or no UUID yet): fall back to matching by name.
  */
 export function sameIdentity(a, b) {
+  if (providerOf(a) !== providerOf(b)) return false;
+  if (providerOf(a) === 'codex') {
+    if (a?.accountId && b?.accountId) return a.accountId === b.accountId;
+    return a?.name === b?.name;
+  }
   if (a?.accountUuid && b?.accountUuid) {
     if (a.accountUuid !== b.accountUuid) return false;
     const ka = orgKey(a);
@@ -43,6 +56,8 @@ export function sameIdentity(a, b) {
  * unknown UUID or org on either side means "cannot tell", never "different".
  */
 export function distinctAccounts(a, b) {
+  if (providerOf(a) !== providerOf(b)) return true;
+  if (providerOf(a) === 'codex') return !!(a?.accountId && b?.accountId && a.accountId !== b.accountId);
   if (!a?.accountUuid || !b?.accountUuid) return false;
   if (a.accountUuid !== b.accountUuid) return true;
   const ka = orgKey(a);

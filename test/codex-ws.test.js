@@ -8,7 +8,7 @@ import assert from 'node:assert/strict';
 import http from 'node:http';
 import net from 'node:net';
 import { AccountManager } from '../src/account-manager.js';
-import { createProxyServer, codexUpgradeTarget } from '../src/server.js';
+import { createProxyServer, codexUpgradeTarget, resolveAccountPin } from '../src/server.js';
 import { relayCodexUpgrade, webSocketRefused, noteWebSocketRefused, clearWebSocketRefusals } from '../src/codex-ws.js';
 import { FrameDecoder, encodeFrame, closeFrame, parseClose, computeAccept, OPCODE } from '../src/ws-frames.js';
 import { setUpstreamProxy, resolveUpstreamProxy } from '../src/upstream-proxy.js';
@@ -738,4 +738,16 @@ test('a refused host only refuses the upgrade outright when every candidate acco
     assert.equal((await client()).status, 426);
   });
   clearWebSocketRefusals();
+});
+
+test('a pin resolves within the provider the request is for, so a Claude namesake is never picked for a Codex path', () => {
+  const am = new AccountManager([
+    { name: 'me@x.com', type: 'oauth', accessToken: 't-claude', refreshToken: 'r', expiresAt: Date.now() + 3600_000 },
+    codex('me@x.com'),
+  ], 0.98);
+  assert.deepEqual(codexUpgradeTarget(am, `/tc-acct/me%40x.com${RESPONSES}`), { path: RESPONSES, pinnedIndex: 1 });
+  assert.equal(resolveAccountPin(am, 'me@x.com', 'codex'), 1);
+  assert.equal(resolveAccountPin(am, 'me@x.com', 'anthropic'), 0);
+  assert.equal(resolveAccountPin(am, 'me@x.com'), 0, 'unscoped keeps the first match');
+  assert.equal(resolveAccountPin(am, 'acct-me@x.com', 'anthropic'), null, 'a Codex id is not a Claude pin');
 });
