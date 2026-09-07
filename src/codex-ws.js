@@ -46,7 +46,7 @@ import { parseRequestModel } from './model.js';
 import { applyAuthHeaders, upstreamFor } from './provider.js';
 import { proxyForHost, proxyAgent } from './upstream-proxy.js';
 import { parseCodexRateLimitsEvent, classifyCodexRejection } from './codex-quota.js';
-import { FrameDecoder, computeAccept, handshakeKey, closeFrame, OPCODE } from './ws-frames.js';
+import { FrameDecoder, computeAccept, handshakeKey, closeFrame, encodeFrame, OPCODE } from './ws-frames.js';
 
 export const WS_BETA = 'responses_websockets=2026-02-06';
 
@@ -78,6 +78,13 @@ const STRIP_UPSTREAM = new Set([
 const EVENT_QUOTA_CODES = new Set(['usage_limit_reached', 'usage_limit_exceeded', 'usage_not_included', 'rate_limit_reached']);
 // Events that end a response, after which the connection may be rotated away.
 const TERMINAL_EVENTS = new Set(['response.completed', 'response.failed', 'response.incomplete', 'error']);
+// Events that open a response without committing any of its output. While
+// only these have arrived the response can still be retried elsewhere; the
+// first event outside this set commits the response to this account.
+const PREAMBLE_EVENTS = new Set(['codex.rate_limits', 'codex.response.metadata']);
+// How much of a response's preamble is held back before it is forwarded
+// regardless — a bound on memory, far above what a preamble carries.
+const HELD_LIMIT = 4 * 1024 * 1024;
 
 let upgradeCounter = 0;
 
@@ -157,7 +164,7 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
   socket.write(`HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: ${computeAccept(key)}\r\n\r\n`);
 
   const clientDecoder = new FrameDecoder();
-  const upstreamDecoder = new FrameDecoder();
+  let upstreamDecoder = new FrameDecoder();
   const state = {
     closed: false,
     dialing: false,
@@ -174,6 +181,14 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
     observeClient: true,
     inResponse: false,     // a response is streaming; rotation waits for its end
     rotateAfterResponse: false,
+    // The client's latest `response.create`, replayed on another account
+    // when this one refuses the response before producing any of it.
+    lastRequest: null,
+    // While `holding`, upstream bytes are kept in `heldRaw` (verbatim chunks,
+    // so a commit forwards exactly what upstream sent) instead of spliced.
+    holding: false,
+    heldRaw: [],
+    heldBytes: 0,
     endStatus: null,
     holdBudgetMs,
     holdTimer: null,
@@ -208,6 +223,12 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
   // ── client side ──────────────────────────────────────────────────────────
 
   const onClientFrame = (frame) => {
+    if (frame.opcode === OPCODE.TEXT) {
+      // Each request opens a response whose preamble is held until output
+      // starts (see observeEvent); the request itself is kept for a replay.
+      state.lastRequest = Buffer.from(frame.payload);
+      state.holding = true;
+    }
     if (frame.opcode === OPCODE.TEXT && !state.dialing) {
       // The first message names the model. Anything else (a prewarm sends
       // `input: []` but still carries `model`) is dialed as-is.
@@ -484,28 +505,87 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
 
     usock.on('data', onUpstreamData);
     // An upgraded socket is half-open by default (see relayUpgrade): react to
-    // both 'end' and 'close' on each side so neither can linger.
-    usock.on('end', () => finish(null, '', 200));
-    usock.on('close', () => finish(null, '', 200));
-    usock.on('error', () => finish(null, '', 200));
+    // both 'end' and 'close' on each side so neither can linger. Guarded by
+    // identity: a socket left behind by a retry (see retryElsewhere) must not
+    // end the client when it finally closes.
+    // A preamble still held when upstream goes away is forwarded first: the
+    // client gets what upstream said (a close frame among it) before its end.
+    const current = () => state.upstreamSocket === usock;
+    usock.on('end', () => { if (current()) { flushHeld(); finish(null, '', 200); } });
+    usock.on('close', () => { if (current()) { flushHeld(); finish(null, '', 200); } });
+    usock.on('error', () => { if (current()) { flushHeld(); finish(null, '', 200); } });
+  }
+
+  /** Forward the held preamble and go back to splicing. */
+  function flushHeld() {
+    if (!state.holding) return;
+    state.holding = false;
+    const held = state.heldRaw;
+    state.heldRaw = [];
+    state.heldBytes = 0;
+    for (const chunk of held) relay(state.upstreamSocket, socket, chunk);
+  }
+
+  /**
+   * The account refused the response before producing any of it (a spent
+   * window, a workspace spend cap, an entitlement): nothing has reached the
+   * client, so the same request can be answered by another account. Drop the
+   * held preamble, leave this upstream, and dial again with the request queued
+   * as the first thing the new upstream hears — the client sees one response.
+   */
+  function retryElsewhere(account, why) {
+    const usock = state.upstreamSocket;
+    state.upstreamSocket = null;
+    state.connected = false;
+    usock.removeAllListeners('data');
+    usock.destroy();
+    state.heldRaw = [];
+    state.heldBytes = 0;
+    state.holding = true;
+    state.inResponse = false;
+    state.rotateAfterResponse = false;
+    state.observeUpstream = true;
+    upstreamDecoder = new FrameDecoder();
+    state.tried.add(account.index);
+    // Client-to-server frames are masked on the wire; the replay is one.
+    const replay = encodeFrame(OPCODE.TEXT, state.lastRequest, { mask: true });
+    state.pending.unshift(replay);
+    state.pendingBytes += replay.length;
+    log(`[TeamClaude] Codex refused the response on "${account.name}" (${why}) before any output — retrying it on another account`);
+    attempt().catch((err) => {
+      log(`[TeamClaude] Codex WebSocket relay failed: ${err?.message || err}`);
+      finish(1011, 'relay failure', 502);
+    });
   }
 
   function onUpstreamData(chunk) {
     if (state.closed) return;
-    relay(state.upstreamSocket, socket, chunk);
-    if (!state.observeUpstream) return;
+    const usock = state.upstreamSocket;
+    if (state.holding) {
+      state.heldRaw.push(chunk);
+      state.heldBytes += chunk.length;
+    } else {
+      relay(usock, socket, chunk);
+    }
+    // Holding is only possible while the frames can be read; without that
+    // there is nothing to judge, and the bytes go through as they are.
+    if (!state.observeUpstream) { flushHeld(); return; }
     let frames;
     try {
       frames = upstreamDecoder.push(chunk);
     } catch {
       // Lost sync with upstream's framing: keep splicing, stop reading.
       state.observeUpstream = false;
+      flushHeld();
       return;
     }
     for (const frame of frames) {
       if (frame.opcode !== OPCODE.TEXT) continue;
       observeEvent(frame.payload);
+      // A retry left this socket behind; the rest of the chunk is its.
+      if (state.upstreamSocket !== usock) return;
     }
+    if (state.holding && state.heldBytes > HELD_LIMIT) flushHeld();
   }
 
   /** Read one upstream event for quota and refusal signals. */
@@ -524,22 +604,37 @@ export function relayCodexUpgrade(req, socket, head, ctx) {
       state.inResponse = true;
       return;
     }
-    if (type === 'response.created') { state.inResponse = true; return; }
+    if (PREAMBLE_EVENTS.has(type)) return;
+    if (type === 'response.created') { state.inResponse = true; flushHeld(); return; }
 
     if (type === 'error' || type === 'response.failed') {
       let code = null;
+      let resetsIn = null;
       try {
         const body = JSON.parse(payload.toString('utf8'));
         const err = body.error || body.response?.error || body;
         code = [err?.code, err?.type].find(v => typeof v === 'string' && v) || null;
+        // Codex's usage-limit errors say when the window reopens; a spend
+        // cap says nothing, and is re-checked after the default hold.
+        if (Number.isFinite(err?.resets_in_seconds)) resetsIn = err.resets_in_seconds;
+        else if (Number.isFinite(err?.resets_at)) resetsIn = err.resets_at * 1000 - Date.now() > 0 ? (err.resets_at * 1000 - Date.now()) / 1000 : null;
       } catch { /* not JSON: nothing to classify */ }
       if (code && EVENT_QUOTA_CODES.has(code)) {
         const modelOnly = state.model && am.modelBucketSpent(account.index, state.model);
-        if (!modelOnly) am.markRateLimited(account.index, QUOTA_HOLD_SECONDS);
+        const hold = resetsIn != null ? Math.min(Math.max(Math.ceil(resetsIn), 60), 8 * 24 * 3600) : QUOTA_HOLD_SECONDS;
+        if (!modelOnly) am.markRateLimited(account.index, hold);
+        // Nothing of this response has reached the client yet, and this is
+        // no pin: another account can answer the very same request. Only
+        // when one has headroom — otherwise the true error is the answer.
+        const canRetry = state.holding && pinnedIndex == null && state.lastRequest
+          && am.getActiveAccount(new Set([...state.tried, account.index]), state.model, null, sessionId, 'codex');
+        if (canRetry) { retryElsewhere(account, code); return; }
         log(`[TeamClaude] Codex quota exhausted mid-connection (${code}) on "${account.name}" — rotating on the next connection`);
         state.rotateAfterResponse = true;
       }
     }
+    // Anything else is output, or a verdict the client must see: commit.
+    flushHeld();
 
     if (TERMINAL_EVENTS.has(type)) {
       state.inResponse = false;
