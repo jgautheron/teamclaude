@@ -12,8 +12,10 @@ test('exportQuotaState carries only persistable fields and identity, no credenti
   am.accounts[0].quota.unified7d = 0.42;
   const [entry] = am.exportQuotaState();
 
-  assert.deepEqual(Object.keys(entry).sort(), ['accountUuid', 'name', 'orgName', 'orgUuid', 'profile', 'quota'].sort());
+  assert.deepEqual(Object.keys(entry).sort(), ['accountId', 'accountUuid', 'name', 'orgName', 'orgUuid', 'profile', 'provider', 'quota'].sort());
   assert.equal(entry.accountUuid, 'p1');
+  assert.equal(entry.provider, 'anthropic');
+  assert.equal(entry.accountId, null);
   assert.equal(entry.quota.unified7d, 0.42);
   // Transient/credential fields must not leak.
   assert.ok(!('probing' in entry.quota));
@@ -97,4 +99,33 @@ test('getStatePath sits beside the config as a .state.json sibling', () => {
     if (prev === undefined) delete process.env.TEAMCLAUDE_CONFIG;
     else process.env.TEAMCLAUDE_CONFIG = prev;
   }
+});
+
+test('saved quota never crosses from a Claude account to its Codex namesake, and Claude-only fields are not restored onto Codex rows', () => {
+  const codex = (name, extra = {}) => oauth(name, { provider: 'codex', accountId: 'c1', ...extra });
+  const before = new AccountManager([oauth('me@x.com', { accountUuid: 'u1', orgUuid: 'o1' }), codex('me@x.com')], 0.98);
+  before.accounts[0].quota.unified7d = 0.2;
+  before.accounts[0].quota.unified7dFable = 0.7;
+  before.accounts[0].quota.unified7dFableReset = 123;
+  before.accounts[1].quota.unified7d = 0.9;
+  before.accounts[1].quota.planType = 'pro';
+  const saved = before.exportQuotaState();
+  assert.equal(saved[1].provider, 'codex');
+  assert.equal(saved[1].accountId, 'c1');
+  // The Codex row listed FIRST in the new fleet, and the Claude namesake without a UUID yet.
+  const after = new AccountManager([codex('me@x.com'), oauth('me@x.com')], 0.98);
+  after.restoreQuotaState(saved);
+  assert.equal(after.accounts[0].quota.unified7d, 0.9, 'the Codex row gets its own weekly');
+  assert.equal(after.accounts[0].quota.planType, 'pro');
+  assert.equal(after.accounts[0].quota.unified7dFable, null, 'no Fable bucket on a Codex row');
+  assert.equal(after.accounts[1].quota.unified7d, 0.2, 'the Claude row gets its own');
+  assert.equal(after.accounts[1].quota.unified7dFable, 0.7);
+  // A state file written before identities were provider-scoped may carry a
+  // Fable bucket on the Codex entry itself: it is dropped on restore.
+  const stale = [{ provider: 'codex', accountId: 'c1', name: 'me@x.com', quota: { unified7d: 0.5, unified7dFable: 0.7, unified7dFableReset: 123 } }];
+  const healed = new AccountManager([codex('me@x.com')], 0.98);
+  healed.restoreQuotaState(stale);
+  assert.equal(healed.accounts[0].quota.unified7d, 0.5);
+  assert.equal(healed.accounts[0].quota.unified7dFable, null);
+  assert.equal(healed.accounts[0].quota.unified7dFableReset, null);
 });
