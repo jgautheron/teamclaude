@@ -172,6 +172,22 @@ Add the accounts with `teamclaude login --codex` or `teamclaude import --codex
 [--from <auth.json>]` — see [Codex accounts](accounts.md#codex-accounts-experimental)
 for why `import` warns about the refresh token.
 
+**Resuming sessions.** Codex tags every session with the provider it ran
+under, and its picker, `resume --last` and `resume <name>` only consider
+sessions tagged with the *current* provider (Codex 0.153 `named_session_lookup`
+/ `resume_picker`, a provider-scoped `thread/list`). A session started with
+plain `codex` is tagged `openai`; one started through the proxy is tagged
+`teamclaude`. So `teamclaude run --codex -- resume <name>` fails with "No
+saved session found" for a session that was started outside the proxy, and
+vice versa, while **`resume <uuid>`** works across the boundary (`thread/read`
+applies no provider filter). Use the id Codex prints at exit, or pick one side
+for good: `teamclaude env --codex >> ~/.codex/config.toml` makes the proxy the
+provider for every launch, so all new sessions share one tag. The built-in
+`openai` provider cannot be pointed at the proxy instead: Codex 0.153 rejects
+`model_providers.openai` as reserved, and a ChatGPT-authenticated Codex ignores
+`OPENAI_BASE_URL` and only moves its ancillary endpoints with
+`chatgpt_base_url` (all three verified on 0.153.4).
+
 ## Command reference
 
 ```bash
