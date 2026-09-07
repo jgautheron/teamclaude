@@ -213,6 +213,28 @@ export function spendTag(quota) {
   return (spend.usedMinor || 0) > 0 ? '$!' : '$';
 }
 
+/**
+ * `↻ 12m`: how long until a throttled or paused account is tried again. The
+ * status word alone left the operator guessing whether the hold was a minute
+ * or an hour; the timestamp was already in status --json, so the row says it.
+ * Empty once the hold has passed, even if the status word lags a sweep.
+ */
+export function holdTag(account, now = Date.now()) {
+  const until = Math.max(
+    account?.status === 'throttled' ? (parseTsMs(account.rateLimitedUntil) ?? 0) : 0,
+    parseTsMs(account?.pausedUntil) ?? 0,
+  );
+  if (!until || until <= now) return '';
+  const left = formatReset(until, now);
+  return left ? `↻ ${left}` : '';
+}
+
+function parseTsMs(v) {
+  if (v == null) return null;
+  const n = typeof v === 'number' ? v : new Date(v).getTime();
+  return Number.isFinite(n) ? n : null;
+}
+
 export function blockedFamilies(quota, threshold, { provider = 'anthropic' } = {}) {
   const at = typeof threshold === 'function' ? threshold : () => threshold;
   const out = [];
@@ -257,9 +279,9 @@ export function fitLine(s, w) {
   return s;
 }
 
-function formatReset(resetTs) {
+function formatReset(resetTs, now = Date.now()) {
   if (!resetTs) return '';
-  const ms = resetTs - Date.now();
+  const ms = resetTs - now;
   if (ms <= 0) return '';
   const mins = Math.ceil(ms / 60000);
   if (mins < 60) return `${mins}m`;
@@ -1487,7 +1509,12 @@ export class TUI {
       const tag = spendTag(a.quota);
       return tag ? Math.max(w, 2 + vw(tag)) : w;
     }, 0);
-    const fixed = (compact ? 20 : 28) + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW;
+    // And for the `↻ 12m` hold countdown on a throttled or paused account.
+    const holdW = accts.reduce((w, a) => {
+      const tag = holdTag(a);
+      return tag ? Math.max(w, 2 + vw(tag)) : w;
+    }, 0);
+    const fixed = (compact ? 20 : 28) + NAME_MIN + (genRoutes.length ? genRoutes.length + 1 : 0) + tagW + spendW + holdW;
     const roomFor = n => fixed + 6 * (n - 1) + n * BAR_MIN <= W;
     // The family bars are the first thing to go: below the width where they
     // fit even at BAR_MIN they would push the row past the edge, and a row cut
@@ -1698,6 +1725,10 @@ export class TUI {
     // OWN configured threshold.
     const blocked = blockedFamilies(q, limFor, { provider: providerOf(a) });
     if (blocked.length) line += `  ${red('⊘ ' + blocked.join(' '))}`;
+    // When a throttled or paused account is tried again, so "throttled" is a
+    // countdown rather than a verdict.
+    const hold = holdTag(a);
+    if (hold) line += `  ${yellow(hold)}`;
     // Money tag last, so it sits at the end of the row where the eye lands after
     // the bars. Red once real money has moved, yellow while it only could.
     const money = spendTag(q);

@@ -6,7 +6,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { AccountManager } from '../src/account-manager.js';
-import { TUI } from '../src/tui.js';
+import { TUI, holdTag } from '../src/tui.js';
 
 const strip = s => s.replace(/\x1b\[[0-9;]*m/g, '');
 const h = 3600_000;
@@ -132,4 +132,27 @@ test('a Codex row never draws or bars the Claude families, even from a stale sta
   assert.doesNotMatch(right, /F7/, 'no Fable bar on the Codex row');
   assert.match(right, /⊘ GPT-5\.3-Codex-Spark/, 'the spent weekly bars the Codex family');
   assert.doesNotMatch(right, /Fable/, 'and never a Claude family');
+});
+
+test('a throttled or paused account shows when it is tried again', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(holdTag({ status: 'throttled', rateLimitedUntil: now + 12 * 60_000 }, now), '↻ 12m');
+  assert.equal(holdTag({ status: 'throttled', rateLimitedUntil: new Date(now + 90 * 60_000).toISOString() }, now), '↻ 1h30m', 'status payloads carry ISO strings');
+  assert.equal(holdTag({ status: 'active', pausedUntil: now + 45_000 }, now), '↻ 1m');
+  assert.equal(holdTag({ status: 'throttled', rateLimitedUntil: now - 1 }, now), '', 'a hold that has passed says nothing');
+  assert.equal(holdTag({ status: 'active', rateLimitedUntil: now + 60_000 }, now), '', 'a stale timestamp on an active account is not a hold');
+  assert.equal(holdTag({ status: 'active' }, now), '');
+});
+
+test('the hold countdown is drawn on the row and budgeted in the layout', () => {
+  const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  am.markRateLimited(2, 12 * 60);
+  for (const width of [180, 120]) {
+    const lines = screen(am, width);
+    const rows = listLines(lines).slice(1).filter(l => l.trim());
+    const k2 = rows.find(l => /k2@x\.com/.test(l));
+    assert.match(k2, /throttled.*↻ 12m/, `the throttled row carries the countdown at ${width}`);
+    assert.doesNotMatch(rows.find(l => /k1@x\.com/.test(l)), /↻/);
+    for (const l of lines) assert.ok(l.length <= width, `overflow at ${width}: ${l.length}`);
+  }
 });

@@ -8,7 +8,7 @@ Running the server, running Claude Code through it, and the full command referen
 teamclaude server
 ```
 
-From a TTY this shows the interactive TUI: an account table with session/weekly quota bars and reset countdowns, a real-time activity log, and keyboard controls.
+From a TTY this shows the interactive TUI: an account table with session/weekly quota bars and reset countdowns, a real-time activity log, and keyboard controls. A row's tags say why it is not serving: `⊘ Fable` for a family the account cannot serve right now, `↻ 12m` for how long a throttled or paused account waits before it is tried again, `$`/`$!` when extra usage could cost or has cost money.
 
 It falls back to plain log output when stdout is not a TTY (e.g. running as a service). Pass `--headless` (or `--no-tui`) to force plain-log mode from a terminal — useful for backgrounding the proxy.
 
