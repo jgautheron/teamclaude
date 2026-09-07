@@ -348,7 +348,7 @@ test('a non-101 upstream answer with a body closes the client with its status', 
 
 test('a fragmented response.create still names the model and reaches upstream whole', async () => {
   let seen = null;
-  await withProxy({ 't-a': { ws: async (conn) => { seen = await conn.text(); conn.send(rateLimitsEvent(1)); } } }, async ({ client, hits }) => {
+  await withProxy({ 't-a': { ws: async (conn) => { seen = await conn.text(); conn.send(rateLimitsEvent(1)); conn.send(JSON.stringify({ type: 'response.created', response: { id: 'r1' } })); } } }, async ({ client, hits }) => {
     const c = await client();
     const text = create('gpt-5.4', { input: [{ role: 'user', content: 'x'.repeat(70_000) }] });
     c.sendRaw(encodeFrame(OPCODE.TEXT, text.slice(0, 100), { mask: true, fin: false }));
@@ -359,7 +359,76 @@ test('a fragmented response.create still names the model and reaches upstream wh
   });
 });
 
-test('a mid-connection quota error is relayed, then the client is closed with 1012 and the next connection lands elsewhere', async () => {
+test('a quota error before any output is answered by another account, and the client never sees it', async () => {
+  let replayed = null;
+  const spendCap = { type: 'error', error: { type: 'usage_limit_reached', message: 'You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.', rate_limit_reached_type: 'workspace_member_usage_limit_reached', resets_in_seconds: 3600 } };
+  await withProxy({
+    't-a': { ws: async (conn) => { await conn.text(); conn.send(rateLimitsEvent(50)); conn.send(JSON.stringify(spendCap)); } },
+    't-b': { ws: async (conn) => { replayed = await conn.text(); conn.send(rateLimitsEvent(20)); conn.send(JSON.stringify({ type: 'response.created', response: { id: 'r1' } })); conn.send(JSON.stringify({ type: 'response.completed', response: { id: 'r1' } })); } },
+  }, async ({ client, am, hits }) => {
+    const c = await client();
+    const request = create('gpt-5.4', { input: [{ role: 'user', content: 'hello' }] });
+    c.send(request);
+    const types = [];
+    for (let i = 0; i < 3; i++) types.push(JSON.parse(await c.text()).type);
+    assert.deepEqual(types, ['codex.rate_limits', 'response.created', 'response.completed'], 'only the second account\'s response reaches the client');
+    assert.equal(replayed, request, 'the very same request is replayed');
+    assert.deepEqual(hits.map(h => h.token), ['t-a', 't-b']);
+    assert.equal(am.accounts[0].status, 'throttled');
+    const until = am.accounts[0].rateLimitedUntil - Date.now();
+    assert.ok(until > 3500_000 && until <= 3600_000, `held for the window the error names: ${until}`);
+    assert.equal(am.accounts[1].quota.unified7d, 0.2, 'the serving account\'s reading is the one learned');
+    assert.equal(am.accounts[0].quota.unified7d, 0.5, 'the refusing account\'s reading is kept too');
+  });
+});
+
+test('with no other account in reach, the early quota error goes to the client and the connection closes with 1012', async () => {
+  await withProxy({
+    't-a': { ws: async (conn) => {
+      await conn.text();
+      conn.send(rateLimitsEvent(50));
+      conn.send(JSON.stringify({ type: 'error', error: { code: 'usage_limit_reached', message: 'spent' } }));
+    } },
+  }, async ({ client, am, hits }) => {
+    const c = await client();
+    c.send(create('gpt-5.4'));
+    assert.equal(JSON.parse(await c.text()).type, 'codex.rate_limits');
+    assert.equal(JSON.parse(await c.text()).type, 'error', 'the true error is the answer when nothing has headroom');
+    const close = await c.closed();
+    assert.equal(close.code, 1012);
+    assert.equal(am.accounts[0].status, 'throttled');
+    assert.equal(hits.length, 1);
+  }, { accounts: [codex('a')] });
+});
+
+test('a quota error after output has started is relayed as-is; the connection closes after the response, never under it', async () => {
+  await withProxy({
+    't-a': { ws: async (conn) => {
+      await conn.text();
+      conn.send(rateLimitsEvent(50));
+      conn.send(JSON.stringify({ type: 'response.created', response: { id: 'r1' } }));
+      conn.send(JSON.stringify({ type: 'response.output_text.delta', delta: 'hi' }));
+      conn.send(JSON.stringify({ type: 'error', error: { code: 'usage_limit_reached', message: 'spent' } }));
+    } },
+    't-b': { ws: serve() },
+  }, async ({ client, am, hits }) => {
+    const c = await client();
+    c.send(create('gpt-5.4'));
+    const types = [];
+    for (let i = 0; i < 4; i++) types.push(JSON.parse(await c.text()).type);
+    assert.deepEqual(types, ['codex.rate_limits', 'response.created', 'response.output_text.delta', 'error']);
+    const close = await c.closed();
+    assert.equal(close.code, 1012);
+    assert.deepEqual(hits.map(h => h.token), ['t-a'], 'no second dial under a response that has output');
+    const next = await client();
+    next.send(create('gpt-5.4'));
+    await next.text();
+    assert.deepEqual(hits.map(h => h.token), ['t-a', 't-b'], 'the next connection lands elsewhere');
+    assert.equal(am.accounts[0].status, 'throttled');
+  });
+});
+
+test('a pinned connection is never retried on another account', async () => {
   await withProxy({
     't-a': { ws: async (conn) => {
       await conn.text();
@@ -367,21 +436,14 @@ test('a mid-connection quota error is relayed, then the client is closed with 10
       conn.send(JSON.stringify({ type: 'error', error: { code: 'usage_limit_reached', message: 'spent' } }));
     } },
     't-b': { ws: serve() },
-  }, async ({ client, am, hits }) => {
-    const c = await client();
+  }, async ({ client, hits }) => {
+    const c = await client(`/tc-acct/a${RESPONSES}`);
     c.send(create('gpt-5.4'));
-    await c.text();
-    assert.equal(JSON.parse(await c.text()).type, 'error', 'the error frame itself reaches the client');
-    const close = await c.closed();
-    assert.equal(close.code, 1012);
-    assert.equal(am.accounts[0].status, 'throttled');
-    const next = await client();
-    next.send(create('gpt-5.4'));
-    await next.text();
-    assert.deepEqual(hits.map(h => h.token), ['t-a', 't-b']);
+    assert.equal(JSON.parse(await c.text()).type, 'codex.rate_limits');
+    assert.equal(JSON.parse(await c.text()).type, 'error');
+    assert.deepEqual(hits.map(h => h.token), ['t-a']);
   });
 });
-
 test('crossing the threshold on a response closes the connection between responses, never during one', async () => {
   const frames = [];
   await withProxy({

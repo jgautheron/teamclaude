@@ -80,12 +80,23 @@ TeamClaude relays that connection rather than splicing it blind:
   a plain HTTP `426` itself; Codex then takes `POST` + SSE at once. Verified
   live: the first launch cost one refused dial, the second never opened a
   WebSocket.
-- An account that becomes **ineligible mid-connection** — a `usage_limit_reached`
-  error event, or a `codex.rate_limits` reading over the switch threshold — is
-  never swapped under a response in flight (`previous_response_id` binds the
-  connection to it). The relay lets the response finish and then closes the
-  client with `1012`; Codex reconnects with its full input, and the new
-  connection is routed afresh. Verified live: a turn closed after every
+- Each response's **preamble** (`codex.rate_limits`, `codex.response.metadata`)
+  is held back until the first output event commits it. A **quota or
+  entitlement error that arrives before any output** — a spent window, a
+  workspace spend cap (`workspace_member_usage_limit_reached`), a model the
+  account cannot serve — therefore never reaches the client: the account is
+  marked (for the window the error names, else 15 min), the held preamble is
+  dropped, and the very same `response.create` is replayed on another account
+  with headroom, so Codex sees one response. This is what keeps Codex's own
+  "Usage limit reached — request an increase?" prompt off the screen while
+  another account can serve. The error goes through as-is only when no other
+  account can serve (it is then the honest answer) or the session is pinned.
+- An account that becomes **ineligible once output has started** — an error
+  event after the first delta, or a `codex.rate_limits` reading over the
+  switch threshold — is never swapped under the response (`previous_response_id`
+  binds the connection to it). The relay lets the response finish and then
+  closes the client with `1012`; Codex reconnects with its full input, and the
+  new connection is routed afresh. Verified live: a turn closed after every
   response reconnected each time and finished correctly.
 - When **no account has headroom** and `holdSeconds` is set, the connection is
   kept open and re-routed on the same poll the HTTP path uses ([hold on
