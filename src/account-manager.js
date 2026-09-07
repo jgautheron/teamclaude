@@ -39,6 +39,14 @@ const PERSISTED_QUOTA_FIELDS = [
   // model-scoped weekly buckets keyed by their header slug, and the plan.
   'unified30d', 'unified30dReset', 'codexModelBuckets', 'planType',
 ];
+// Metered by Anthropic only. A Codex account never learns these, so a saved
+// value can only be a namesake's (a state file written before identities were
+// provider-scoped): restoring it would draw a Fable bar on a Codex row and let
+// the ⊘ tag call Fable "blocked" there.
+const ANTHROPIC_ONLY_QUOTA_FIELDS = new Set([
+  'unified7dSonnet', 'unified7dFable', 'unified7dSonnetReset', 'unified7dFableReset',
+  'unified7dSonnetSeenAt', 'unified7dFableSeenAt',
+]);
 
 // A spent Codex model-scoped bucket is trusted for this long before it is
 // dropped and revalidated, for the same reason the Anthropic family buckets
@@ -2368,7 +2376,7 @@ export class AccountManager {
         hasClaudeMax: a.hasClaudeMax,
         hasClaudePro: a.hasClaudePro,
       };
-      return { accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota };
+      return { provider: providerOf(a), accountId: a.accountId ?? null, accountUuid: a.accountUuid, orgUuid: a.orgUuid, orgName: a.orgName, name: a.name, profile, quota };
     });
   }
 
@@ -2382,11 +2390,15 @@ export class AccountManager {
     for (const account of this.accounts) {
       const match = saved.find(s => sameIdentity(s, account));
       if (!match || !match.quota) continue;
+      const isCodex = providerOf(account) === 'codex';
       for (const f of PERSISTED_QUOTA_FIELDS) {
+        if (isCodex && ANTHROPIC_ONLY_QUOTA_FIELDS.has(f)) continue;
         if (match.quota[f] != null) account.quota[f] = match.quota[f];
       }
-      for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
-        if (match.profile?.[field] != null) account[field] = match.profile[field];
+      if (!isCodex) {
+        for (const field of ['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro']) {
+          if (match.profile?.[field] != null) account[field] = match.profile[field];
+        }
       }
       // We already know this account's weekly window, so it isn't "probing".
       if (account.quota.unified7dReset != null) account.probing = false;

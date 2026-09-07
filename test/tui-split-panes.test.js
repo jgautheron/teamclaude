@@ -117,3 +117,19 @@ test('the split never overflows the terminal across widths', () => {
     for (const l of screen(am, w)) assert.ok(l.length <= w, `W=${w}: ${l.length} columns`);
   }
 });
+
+test('a Codex row never draws or bars the Claude families, even from a stale state file', () => {
+  // Same display name on both sides (one person's two logins), and a Fable
+  // bucket left on the Codex row by a state file written before identities
+  // were provider-scoped.
+  const am = fleet([claude('me@x.com'), codex('me@x.com')]);
+  am.accounts[1].quota.unified7dFable = 0.99;
+  am.accounts[1].quota.unified7dFableReset = Date.now() + 2 * h;
+  am.accounts[1].quota.unified7d = 0.99;
+  const rows = listLines(screen(am, 180)).slice(1).filter(l => l.trim());
+  const [left, right] = rows[0].split(' │ ');
+  assert.match(left, /F7/, 'the Claude row keeps its Fable bar');
+  assert.doesNotMatch(right, /F7/, 'no Fable bar on the Codex row');
+  assert.match(right, /⊘ GPT-5\.3-Codex-Spark/, 'the spent weekly bars the Codex family');
+  assert.doesNotMatch(right, /Fable/, 'and never a Claude family');
+});

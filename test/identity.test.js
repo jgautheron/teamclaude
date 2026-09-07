@@ -264,3 +264,25 @@ test('a token write resolves the right row for one person in two orgs', async ()
   // identity match (which would be the personal row).
   assert.equal(rows.findIndex(r => r.id === acme.id), 1);
 });
+
+test('a Claude and a Codex login sharing a name are never the same identity', () => {
+  const claude = { name: 'me@x.com', accountUuid: 'u1', orgUuid: 'o1' };
+  const claudeBare = { name: 'me@x.com' };
+  const codex = { name: 'me@x.com', provider: 'codex', accountId: 'c1' };
+  const codexBare = { name: 'me@x.com', provider: 'codex' };
+  assert.equal(sameIdentity(claude, codex), false);
+  assert.equal(sameIdentity(claudeBare, codex), false, 'no UUID on the Claude side still does not fall through to the name');
+  assert.equal(sameIdentity(claudeBare, codexBare), false);
+  assert.equal(distinctAccounts(claude, codex), true);
+  assert.equal(distinctAccounts(claudeBare, codexBare), true);
+  // Codex identity is the ChatGPT account id; the name only when an id is missing.
+  assert.equal(sameIdentity(codex, { name: 'other', provider: 'codex', accountId: 'c1' }), true);
+  assert.equal(sameIdentity(codex, { name: 'me@x.com', provider: 'codex', accountId: 'c2' }), false);
+  assert.equal(sameIdentity(codex, codexBare), true);
+  assert.equal(distinctAccounts(codex, { provider: 'codex', accountId: 'c2' }), true);
+  assert.equal(distinctAccounts(codex, codexBare), false);
+  // A Codex login never upserts onto its Claude namesake, and vice versa.
+  assert.equal(findUpsertTarget([claude], codex), -1);
+  assert.equal(findUpsertTarget([codex], claude), -1);
+  assert.equal(findUpsertTarget([claude, codex], { name: 'me@x.com', provider: 'codex', accountId: 'c1' }), 1);
+});
