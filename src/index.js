@@ -30,6 +30,7 @@ import {
 import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, importCodexCredentials, refreshCodexToken, DEFAULT_CODEX_CREDENTIALS_PATH } from './codex-auth.js';
 import { buildCodexOverrides, buildCodexConfigToml, codexProviderSettings } from './codex-env.js';
+import { translateCodexResume } from './codex-sessions.js';
 import { providerOf } from './provider.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds } from './account-pairing.js';
@@ -998,6 +999,15 @@ async function runCodexCommand(config, { tcFlags, codexArgs }) {
   if (await isProxyUp(port)) {
     if (tcAcct) console.error(`[TeamClaude] Pinned to account "${tcAcct}" (TC_ACCT)`);
     overrides = buildCodexOverrides(codexProviderSettings({ port, account: tcAcct, holdSeconds: config.holdSeconds }));
+    // Codex resolves `resume <name>` only among sessions tagged with the
+    // current provider, and through the proxy that tag is ours — a session
+    // started with plain `codex` would not be found. Its id is not filtered,
+    // so hand Codex the id from its own index (see codex-sessions.js).
+    const { args: translated, resolved } = await translateCodexResume(codexArgs);
+    if (resolved) {
+      console.error(`[TeamClaude] Resuming "${resolved.name}" by id ${resolved.id} (Codex lists by name only sessions started under the same provider)`);
+      codexArgs = translated;
+    }
   } else if (autoFallback) {
     console.error(`[TeamClaude] Proxy not running on port ${port} — launching codex directly (--auto-fallback; start it with: teamclaude server)`);
   } else {

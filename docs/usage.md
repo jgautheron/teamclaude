@@ -177,11 +177,13 @@ under, and its picker, `resume --last` and `resume <name>` only consider
 sessions tagged with the *current* provider (Codex 0.153 `named_session_lookup`
 / `resume_picker`, a provider-scoped `thread/list`). A session started with
 plain `codex` is tagged `openai`; one started through the proxy is tagged
-`teamclaude`. So `teamclaude run --codex -- resume <name>` fails with "No
-saved session found" for a session that was started outside the proxy, and
-vice versa, while **`resume <uuid>`** works across the boundary (`thread/read`
-applies no provider filter). Use the id Codex prints at exit, or pick one side
-for good: `teamclaude env --codex >> ~/.codex/config.toml` makes the proxy the
+`teamclaude`. Only **`resume <uuid>`** crosses the boundary (`thread/read`
+applies no provider filter), so `run --codex` translates `resume <name>` (and
+`exec resume <name>`) to the id itself, from Codex's own name index
+(`$CODEX_HOME/session_index.jsonl`), and says so on stderr. The picker and
+`resume --last` cannot be helped this way: they still show only sessions
+started the same way. Use the id Codex prints at exit, or pick one side for
+good: `teamclaude env --codex >> ~/.codex/config.toml` makes the proxy the
 provider for every launch, so all new sessions share one tag. The built-in
 `openai` provider cannot be pointed at the proxy instead: Codex 0.153 rejects
 `model_providers.openai` as reserved, and a ChatGPT-authenticated Codex ignores
