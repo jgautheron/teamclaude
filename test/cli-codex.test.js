@@ -172,3 +172,25 @@ test('accounts lists a Codex entry from its stored identity, without an Anthropi
     assert.match(res.stdout, /Token: expires in/);
   }, { accounts: [{ name: 'work', type: 'oauth', provider: 'codex', source: 'login', accountId: 'acct-9', email: 'me@example.com', planType: 'pro', accessToken: 't', refreshToken: 'r', expiresAt: Date.now() + 7200_000 }] });
 });
+
+test('run --codex translates resume <name> to the id from the Codex session index', async () => {
+  await withSandbox(async ({ run, recorded }) => {
+    const home = await mkdtemp(join(tmpdir(), 'tc-codex-home-'));
+    try {
+      const id = '01a06929-e126-78b2-873c-08efff8ce0ca';
+      await writeFile(join(home, 'session_index.jsonl'), JSON.stringify({ id, thread_name: 'stacks', updated_at: '2026-09-03T21:55:40Z' }) + '\n');
+      const res = run(['run', '--codex', '--', 'resume', 'stacks'], { CODEX_HOME: home });
+      assert.equal(res.status, 0, res.stderr);
+      assert.match(res.stderr, /Resuming "stacks" by id 01a06929/);
+      assert.deepEqual((await recorded()).argv.slice(-2), ['resume', id]);
+      // An id, and a name the index does not know, go through untouched.
+      run(['run', '--codex', '--', 'resume', id], { CODEX_HOME: home });
+      assert.deepEqual((await recorded()).argv.slice(-2), ['resume', id]);
+      const miss = run(['run', '--codex', '--', 'resume', 'nothing'], { CODEX_HOME: home });
+      assert.doesNotMatch(miss.stderr, /Resuming/);
+      assert.deepEqual((await recorded()).argv.slice(-2), ['resume', 'nothing']);
+    } finally {
+      await rm(home, { recursive: true, force: true });
+    }
+  });
+});
