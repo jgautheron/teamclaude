@@ -348,7 +348,7 @@ test('a non-101 upstream answer with a body closes the client with its status', 
 
 test('a fragmented response.create still names the model and reaches upstream whole', async () => {
   let seen = null;
-  await withProxy({ 't-a': { ws: async (conn) => { seen = await conn.text(); conn.send(rateLimitsEvent(1)); conn.send(JSON.stringify({ type: 'response.created', response: { id: 'r1' } })); } } }, async ({ client, hits }) => {
+  await withProxy({ 't-a': { ws: async (conn) => { seen = await conn.text(); conn.send(rateLimitsEvent(1)); conn.send(JSON.stringify({ type: 'response.completed', response: { id: 'r1' } })); } } }, async ({ client, hits }) => {
     const c = await client();
     const text = create('gpt-5.4', { input: [{ role: 'user', content: 'x'.repeat(70_000) }] });
     c.sendRaw(encodeFrame(OPCODE.TEXT, text.slice(0, 100), { mask: true, fin: false }));
@@ -379,6 +379,27 @@ test('a quota error before any output is answered by another account, and the cl
     assert.ok(until > 3500_000 && until <= 3600_000, `held for the window the error names: ${until}`);
     assert.equal(am.accounts[1].quota.unified7d, 0.2, 'the serving account\'s reading is the one learned');
     assert.equal(am.accounts[0].quota.unified7d, 0.5, 'the refusing account\'s reading is kept too');
+  });
+});
+
+test('an error right after response.created, before any output, is still retried elsewhere', async () => {
+  await withProxy({
+    't-a': { ws: async (conn) => {
+      await conn.text();
+      conn.send(rateLimitsEvent(50));
+      conn.send(JSON.stringify({ type: 'response.created', response: { id: 'r1' } }));
+      conn.send(JSON.stringify({ type: 'response.in_progress', response: { id: 'r1' } }));
+      conn.send(JSON.stringify({ type: 'error', error: { type: 'usage_limit_reached', message: 'spent' } }));
+    } },
+    't-b': { ws: serve(20) },
+  }, async ({ client, am, hits }) => {
+    const c = await client();
+    c.send(create('gpt-5.4'));
+    const types = [];
+    for (let i = 0; i < 3; i++) types.push(JSON.parse(await c.text()).type);
+    assert.deepEqual(types, ['codex.rate_limits', 'response.created', 'response.completed']);
+    assert.deepEqual(hits.map(h => h.token), ['t-a', 't-b']);
+    assert.equal(am.accounts[1].quota.unified7d, 0.2);
   });
 });
 
