@@ -156,3 +156,44 @@ test('the hold countdown is drawn on the row and budgeted in the layout', () => 
     for (const l of lines) assert.ok(l.length <= width, `overflow at ${width}: ${l.length}`);
   }
 });
+
+test('a Codex list whose plans meter no short window drops the Ses column; Wk takes the first slot', () => {
+  const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  for (const i of [1, 2]) { am.accounts[i].quota.unified5h = null; am.accounts[i].quota.unified5hReset = null; }
+  const rows = listLines(screen(am, 160)).slice(1).filter(l => l.trim());
+  const [left, right] = rows[0].split(' │ ');
+  assert.match(left, /Ses .*Wk .*F7/, 'the Claude pane is unchanged');
+  assert.doesNotMatch(right, /Ses/, 'no short-window bar in the Codex pane');
+  assert.match(right, /k1@x\.com.*Wk .*Sp7/, 'weekly first, then the family bar');
+  // One account reporting a 5h window brings the column back for the pane.
+  am.accounts[2].quota.unified5h = 0.1;
+  am.accounts[2].quota.unified5hReset = Date.now() + h;
+  const again = listLines(screen(am, 160)).slice(1).filter(l => l.trim());
+  assert.match(again[0].split(' │ ')[1], /Ses .*Wk .*Sp7/);
+});
+
+test('a Codex-only fleet without a short window is one plain list without Ses, and a mixed single column keeps it', () => {
+  const only = fleet([codex('k1@x.com'), codex('k2@x.com')]);
+  for (const a of only.accounts) a.quota.unified5h = null;
+  const rows = listLines(screen(only, 120)).filter(l => /k[12]@x\.com/.test(l));
+  assert.equal(rows.length, 2);
+  for (const r of rows) { assert.doesNotMatch(r, /Ses/); assert.match(r, /Wk .*Sp7/); }
+  // Too narrow to split: Claude and Codex share one column, whose Ses bar the Claude rows need.
+  const mixed = fleet([claude('a@x.com'), codex('k1@x.com')]);
+  mixed.accounts[1].quota.unified5h = null;
+  const narrow = listLines(screen(mixed, 100)).filter(l => /@x\.com/.test(l));
+  assert.equal(narrow.length, 2);
+  for (const r of narrow) assert.match(r, /Ses /);
+});
+
+test('a throttled Codex account with no reading yet still shows the subscription bars, not Tok/Req', () => {
+  const am = fleet([claude('a@x.com'), codex('k1@x.com'), codex('k2@x.com')]);
+  for (const i of [1, 2]) am.accounts[i].quota.unified5h = null;
+  am.accounts[2].quota = { ...am.accounts[2].quota, unified7d: null, unified7dReset: null, codexModelBuckets: {} };
+  am.markRateLimited(2, 600);
+  const rows = listLines(screen(am, 160)).slice(1).filter(l => l.trim());
+  const k2 = rows.map(l => l.split(' │ ')[1]).find(l => /k2@x\.com/.test(l));
+  assert.match(k2, /throttled +Wk +-/, k2);
+  assert.doesNotMatch(k2, /Tok|Req/);
+  assert.match(k2, /↻ 10m/);
+});
