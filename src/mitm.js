@@ -22,6 +22,7 @@ import { getConfigPath } from './config.js';
 import { generateCertChain } from './x509.js';
 import { createProxyRequestListener, resolveClientAuth, loopbackExempt, relayUpgrade, resolveAccountPin, describeConnectError } from './server.js';
 import { interceptHostsFor, isNeverIntercepted } from './provider.js';
+import { OPENROUTER_HOST, openrouterIntercepted, createOpenRouterListener } from './openrouter.js';
 import { forwardRefusal, guardedLookup, FORBIDDEN_FORWARD } from './forward-target.js';
 import { safeLine } from './safe-text.js';
 /** @typedef {import('./types.js').CodedError} CodedError */
@@ -120,10 +121,12 @@ function upstreamHostOf(config) {
 
 /** Every host the MITM leaf must be valid for, given this config. */
 export function mitmHosts(config) {
-  return [...new Set([upstreamHostOf(config), ...interceptHostsFor(config?.accounts || [])])];
+  const hosts = [upstreamHostOf(config), ...interceptHostsFor(config?.accounts || [])];
+  if (openrouterIntercepted(config)) hosts.push(OPENROUTER_HOST);
+  return [...new Set(hosts)];
 }
 
-/** Per-CONNECT behavior: 'rewrite' (intercept + token inject), 'test', or 'tunnel'. */
+/** Per-CONNECT behavior: 'rewrite' (intercept + token inject), 'openrouter', 'test', or 'tunnel'. */
 export function hostMode(host, config) {
   if (host === TEST_HOST) return 'test';
   // Explicitly never intercepted, even though it sits under a provider's domain
@@ -134,6 +137,8 @@ export function hostMode(host, config) {
   // this host-level bypass keeps Desktop's native auth and feature endpoints
   // outside TeamClaude entirely.
   if (config?.proxy?.terminalOnly === true && host === 'chatgpt.com') return 'tunnel';
+  // Terminated for the guard only: its own listener, never an account credential.
+  if (host === OPENROUTER_HOST) return openrouterIntercepted(config) ? 'openrouter' : 'tunnel';
   if (host === upstreamHostOf(config)) return 'rewrite';
   // A second provider's host, and only when an account actually uses that
   // provider. MITM is the mode that works without the client cooperating — a
@@ -208,8 +213,9 @@ export function upgradeUpstreamFor(hostHeader, config, upstream) {
  * @param {Object|null} [opts.egress]
  * @param {Object|null} [opts.clientUsage]
  * @param {Object|null} [opts.dimensionUsage]
+ * @param {string[]|null} [opts.leafHosts]  hosts the leaf was minted for; null trusts hostMode
  */
-export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null }) {
+export function createConnectHandler({ config, accountManager, ensureLeaf, logDir = null, hooks = {}, log = () => {}, sx = null, egress = null, clientUsage = null, dimensionUsage = null, leafHosts = null }) {
   const upstream = config.upstream || 'https://api.anthropic.com';
   const holdMs = (config.holdSeconds || 0) * 1000;
 
@@ -303,6 +309,24 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
     return p;
   };
 
+  // One server for the whole OpenRouter tunnel: it has no pin and no account to bind.
+  let openrouterServer = null;
+  const getOpenRouterServer = () => {
+    openrouterServer ||= ensureLeaf().then(({ key, cert }) => {
+      const srv = http2.createSecureServer({ key, cert, allowHTTP1: true });
+      srv.on('request', createOpenRouterListener({ config, hooks, log }));
+      srv.on('upgrade', (_req, socket) => {
+        try { socket.write('HTTP/1.1 421 Misdirected Request\r\nConnection: close\r\n\r\n'); } catch { /* client already gone */ }
+        socket.destroy();
+      });
+      srv.on('sessionError', (e) => log(`[TeamClaude] OpenRouter session error: ${e.message}`));
+      srv.on('clientError', (_e, sock) => { try { sock.destroy(); } catch { /* already gone */ } });
+      return srv;
+    }).catch((/** @type {unknown} */ err) => { openrouterServer = null; throw err; });
+    return openrouterServer;
+  };
+  let warnedLeaf = false;
+
   return (req, clientSocket, head) => {
     clientSocket.on('error', () => {});
 
@@ -328,7 +352,13 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       return;
     }
     const { host, port } = authority;
-    const mode = hostMode(host, config);
+    let mode = hostMode(host, config);
+    // Enabled by a reload after the leaf was minted: tunnel until a restart covers the host.
+    if (mode === 'openrouter' && leafHosts && !leafHosts.includes(host)) {
+      if (!warnedLeaf) log(`[TeamClaude] OpenRouter interception needs a restart: the MITM certificate does not cover ${OPENROUTER_HOST} yet`);
+      warnedLeaf = true;
+      mode = 'tunnel';
+    }
 
     if (mode === 'tunnel') {
       // Destination policy (see forward-target.js): a tunnel may not reach
@@ -394,6 +424,15 @@ export function createConnectHandler({ config, accountManager, ensureLeaf, logDi
       up.on('close', () => teardown('502 Bad Gateway'));
       clientSocket.on('close', () => teardown()); // client gone: nothing to write
       up.setTimeout(30_000, () => teardown('504 Gateway Timeout')); // bound a stalled connect/idle tunnel
+      return;
+    }
+
+    if (mode === 'openrouter') {
+      getOpenRouterServer().then((/** @type {any} */ srv) => {
+        reply200Raw(clientSocket);
+        if (head && head.length) clientSocket.unshift(head);
+        srv.emit('connection', clientSocket);
+      }).catch((/** @type {Error} */ err) => { log(`[TeamClaude] MITM ${host}: ${err.message}`); reply502Raw(clientSocket); clientSocket.destroy(); });
       return;
     }
 

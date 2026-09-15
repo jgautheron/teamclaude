@@ -515,7 +515,7 @@ export function createProxyServer(accountManager, config, hooks = {}, sx = null,
     const c = await certsPromise;
     return { key: c.leafKeyPem, cert: c.leafCertPem };
   };
-  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage }));
+  server.on('connect', createConnectHandler({ config, accountManager, ensureLeaf, logDir, hooks, log: console.error, sx, egress, clientUsage, dimensionUsage, leafHosts: mitmHostList }));
   // Remote Control's real-time channel is a WebSocket, not a request/response
   // call — Node fires 'upgrade' for that handshake, never 'request', so it
   // needs its own listener (base-URL routing path; the MITM path wires the
