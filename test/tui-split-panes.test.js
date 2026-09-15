@@ -58,8 +58,12 @@ function screen(am, width) {
     tui.running = true;
     tui.render(true);
   } finally {
+    // A non-TTY stdout has no own size properties: remove the mocked ones
+    // rather than leave them for the next test to read.
     if (cols) Object.defineProperty(process.stdout, 'columns', cols);
+    else delete process.stdout.columns;
     if (rows) Object.defineProperty(process.stdout, 'rows', rows);
+    else delete process.stdout.rows;
   }
   const lines = strip(buf).replace(/^\x1b\[H/, '').split('\r\n').map(l => l.replace(/\x1b\[\?25[hl]$/, ''));
   return { lines, drawn, tui };
