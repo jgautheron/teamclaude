@@ -1459,6 +1459,13 @@ export class AccountManager {
     return best ? best.index : null;
   }
 
+  /** The current account of one provider's pool, as an index: what the TUI
+   * marks with ► on that pool's rows, and what `currentAccounts` names in the
+   * status payload. Null when no account can serve that provider. Moves nothing. */
+  currentIndexFor(/** @type {string} */ provider) {
+    return this._currentIndexForProvider(provider);
+  }
+
   /** The cursor owned by one provider, falling back to the account that its
    * next request would start from before that provider has seen traffic. */
   _currentIndexForProvider(provider) {

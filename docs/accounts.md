@@ -167,6 +167,14 @@ accounts is eligible: Claude Code posts to `/v1/messages`, Codex posts to
 request and vice versa, so the two rotate independently on one port, one config
 and one TUI.
 
+The TUI draws the two pools as two panes, Claude on the left and Codex on the
+right, so the list is as tall as the larger pool rather than both stacked. Each
+pool rotates on a cursor of its own, so each pane marks its own current account
+with `►`. A pane drops the type column, since its title already names the
+provider, and a Codex pane where no account meters a 5-hour window drops the
+`Ses` bar and starts at `Wk`. On a terminal too narrow for two panes the list
+is one column again, Claude rows first, with the provider in the type column.
+
 ### What differs from a Claude account
 
 - The credential is injected as `Authorization: Bearer`, plus a
