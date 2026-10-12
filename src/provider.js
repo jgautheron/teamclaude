@@ -15,7 +15,14 @@
 
 import { classificationPath } from './classification-path.js';
 
-/** Providers keyed by the value used in an account's `provider` field. */
+/**
+ * @typedef {{ id: string, label: string, upstream: string, rewritesBody: boolean, headersTimeoutMs: number|null, exclusive?: boolean }} Provider
+ */
+
+/**
+ * Providers keyed by the value used in an account's `provider` field.
+ * @type {Record<string, Provider>}
+ */
 export const PROVIDERS = {
   anthropic: {
     id: 'anthropic',
@@ -48,6 +55,22 @@ export const PROVIDERS = {
     // into a loop of them. Five minutes is the wait that keeps the
     // dead-socket guard useful while leaving a long reasoning turn alone.
     headersTimeoutMs: 300_000,
+  },
+  'opencode-go': {
+    id: 'opencode-go',
+    label: 'OpenCode Go',
+    // The Go plan's gateway serves three protocols under one prefix —
+    // /zen/go/v1/messages, /chat/completions and /responses — so the client
+    // keeps its own base URL path and only the origin changes.
+    upstream: 'https://opencode.ai',
+    rewritesBody: false,
+    // Reasoning models answer a non-streamed request only once they finish
+    // thinking, the same wait as Codex.
+    headersTimeoutMs: 300_000,
+    // A Go key is a seat on one gateway: its paths mean nothing to any other
+    // backend, and no other account can answer them. Partitioned like a
+    // subscription although it is an API key.
+    exclusive: true,
   },
 };
 
@@ -93,12 +116,18 @@ export function isSubscriptionAccount(account) {
  * set itself — how many accounts the request could ever have landed on, and
  * whose windows may speak for when it becomes servable again.
  *
+ * An `exclusive` provider (a gateway such as OpenCode Go) is fenced both ways:
+ * its accounts serve only its paths, and only its accounts serve them.
+ *
  * @param {Record<string, any>|null|undefined} account
  * @param {string} provider
  * @returns {boolean}
  */
 export function canServeProvider(account, provider) {
-  return providerOf(account) === provider || !isSubscriptionAccount(account);
+  const own = providerOf(account);
+  if (own === provider) return true;
+  if (PROVIDERS[own].exclusive || (isKnownProvider(provider) && PROVIDERS[provider].exclusive)) return false;
+  return !isSubscriptionAccount(account);
 }
 
 // The hosts each provider is reached on, for MITM interception.
@@ -162,6 +191,15 @@ export function isKnownProvider(id) {
 // and it keeps the Codex namespace clearly separated from Anthropic's `/v1/*`.
 const CODEX_PATHS = ['/backend-api/codex'];
 
+// OpenCode Go clients (pi, opencode, …) take `<proxy>/zen/go` (or `/zen/go/v1`)
+// as their base URL, so the gateway's own paths arrive here unchanged.
+const OPENCODE_GO_PREFIX = '/zen/go';
+// A Zen pay-as-you-go key answers the same protocols one level up, billed
+// from credits instead of the Go plan.
+const OPENCODE_ZEN_PREFIX = '/zen';
+
+const underPrefix = (/** @type {string} */ path, /** @type {string} */ p) => path === p || path.startsWith(`${p}/`);
+
 /**
  * Which provider should serve a request path.
  *
@@ -179,9 +217,37 @@ export function providerForPath(url) {
   // `new URL()` folds to a Codex path before sending it — does not classify as
   // Codex at all, so it draws the wrong pool's credential.
   const path = classificationPath(url);
-  return CODEX_PATHS.some(p => path === p || path.startsWith(`${p}/`))
-    ? 'codex'
-    : DEFAULT_PROVIDER;
+  if (CODEX_PATHS.some(p => underPrefix(path, p))) return 'codex';
+  if (underPrefix(path, OPENCODE_GO_PREFIX)) return 'opencode-go';
+  return DEFAULT_PROVIDER;
+}
+
+/**
+ * Whether an OpenCode account is a Zen pay-as-you-go key rather than a Go
+ * subscription key. Both are console API keys; only the account says which.
+ * @param {Record<string, any>|null|undefined} account
+ */
+export function isOpencodeZenAccount(account) {
+  return providerOf(account) === 'opencode-go' && account?.plan === 'zen';
+}
+
+/**
+ * The path a request is sent upstream with for this account. Verbatim, except
+ * on an OpenCode account:
+ * - A missing `/v1` is restored. Go's Anthropic-shaped models use `/zen/go` as
+ *   their base and the OpenAI-shaped ones `/zen/go/v1`, so a client given one
+ *   base for all of them (pi's provider `baseUrl`) sends `/zen/go/chat/completions`.
+ * - A Zen pay-as-you-go key serves the request from Zen's own endpoints:
+ *   `/zen/go/v1/messages` becomes `/zen/v1/messages`.
+ *
+ * @param {Record<string, any>} account
+ * @param {string} url  the request URL as it arrived
+ */
+export function upstreamPathFor(account, url) {
+  if (providerOf(account) !== 'opencode-go' || !url.startsWith(`${OPENCODE_GO_PREFIX}/`)) return url;
+  let rest = url.slice(OPENCODE_GO_PREFIX.length);
+  if (!/^\/v1(?:[/?#]|$)/.test(rest)) rest = `/v1${rest}`;
+  return (isOpencodeZenAccount(account) ? OPENCODE_ZEN_PREFIX : OPENCODE_GO_PREFIX) + rest;
 }
 
 /**
@@ -196,9 +262,16 @@ export function providerForPath(url) {
  *   a token to one ChatGPT account. It is the direct counterpart of the
  *   `account_uuid` that the Anthropic path patches into the request body —
  *   a header here, so no body rewrite is involved.
+ * - OpenCode reads `x-api-key` on its Anthropic-shaped `/messages` endpoint and
+ *   `Authorization: Bearer` everywhere else, so both carry the key.
  */
 export function applyAuthHeaders(headers, account) {
   const provider = providerOf(account);
+  if (provider === 'opencode-go') {
+    headers['authorization'] = `Bearer ${account.credential}`;
+    headers['x-api-key'] = account.credential;
+    return;
+  }
   if (provider === 'codex') {
     headers['authorization'] = `Bearer ${account.credential}`;
     if (account.accountId) headers['chatgpt-account-id'] = account.accountId;

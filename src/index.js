@@ -120,6 +120,19 @@ import {
   setAccountPriority,
   renameAccount,
 } from './config-ops.js';
+
+/**
+ * The kind of key `login --api` stores. An OpenCode Go key is a subscription
+ * seat and rotates level with other subscriptions; a Zen key is metered like an
+ * Anthropic one and waits at the back.
+ * @typedef {{ label: string, kind: string, prefix: string, entry: Record<string, string>, defaultPriority: number }} ApiKeyKind
+ */
+/** @type {Record<string, ApiKeyKind>} */
+const API_KEY_KINDS = {
+  anthropic: { label: 'Anthropic API key', kind: 'API key', prefix: 'api-', entry: {}, defaultPriority: APIKEY_DEFAULT_PRIORITY },
+  opencodeGo: { label: 'OpenCode Go API key', kind: 'OpenCode Go', prefix: 'opencode-go-', entry: { provider: 'opencode-go' }, defaultPriority: 0 },
+  opencodeZen: { label: 'OpenCode Zen API key', kind: 'OpenCode Zen', prefix: 'opencode-zen-', entry: { provider: 'opencode-go', plan: 'zen' }, defaultPriority: APIKEY_DEFAULT_PRIORITY },
+};
 /** @typedef {import('./types.js').CodedError} CodedError */
 
 // These constants are referenced by routeCommand, which the dispatch below
@@ -1325,6 +1338,10 @@ async function loginCommand() {
     await loginCodexCommand();
     return;
   }
+  if (args.includes('--opencode-go')) {
+    await loginApiCommand(args.includes('--zen') ? API_KEY_KINDS.opencodeZen : API_KEY_KINDS.opencodeGo);
+    return;
+  }
 
   // Default to OAuth if not a TTY
   if (!process.stdout.isTTY) {
@@ -1352,13 +1369,13 @@ async function loginCommand() {
   }
 }
 
-async function loginApiCommand() {
+async function loginApiCommand(kind = API_KEY_KINDS.anthropic) {
   const loaded = await loadOrCreateConfig(); // first run: create the file; the save re-reads it
   let name = argValue('--name');
   // `--priority 0` puts the key level with the subscriptions, which is what an
   // added key did before; any integer is taken as given.
   const priorityArg = argValue('--priority');
-  const priority = priorityArg == null ? APIKEY_DEFAULT_PRIORITY : Number(priorityArg);
+  const priority = priorityArg == null ? kind.defaultPriority : Number(priorityArg);
   if (!Number.isInteger(priority)) {
     console.error(`--priority wants an integer (lower = preferred, default ${APIKEY_DEFAULT_PRIORITY}), got "${priorityArg}"`);
     process.exit(1);
@@ -1367,10 +1384,10 @@ async function loginApiCommand() {
   // routing for it to borrow (and `none` is what it gets without the flag).
   const { routing } = routingFlag();
   refuseSelfRouting(routing, loaded);
-  await requireWorkingRouting(routing, upstreamFor({ type: 'apikey' }, loaded.upstream));
+  await requireWorkingRouting(routing, upstreamFor({ type: 'apikey', ...kind.entry }, loaded.upstream));
 
   const rl = createInterface({ input: process.stdin, output: process.stderr });
-  const apiKey = await new Promise(resolve => rl.question('Anthropic API key: ', resolve));
+  const apiKey = await new Promise(resolve => rl.question(`${kind.label}: `, resolve));
   rl.close();
 
   if (!apiKey.trim()) {
@@ -1384,15 +1401,15 @@ async function loginApiCommand() {
   // lose that account on its next restart, so the row is added to a fresh read.
   const config = await atomicConfigUpdate(disk => {
     if (!name) {
-      const n = disk.accounts.filter(a => a.name.startsWith('api-')).length + 1;
-      name = `api-${n}`;
+      const n = disk.accounts.filter(a => a.name.startsWith(kind.prefix)).length + 1;
+      name = `${kind.prefix}${n}`;
     }
     disk.accounts.push({
-      name, type: 'apikey', apiKey: apiKey.trim(), priority,
+      name, type: 'apikey', ...kind.entry, apiKey: apiKey.trim(), priority,
       ...(routing ? { routing: routingToUrl(routing) } : {}),
     });
   });
-  console.log(`Added API key account "${name}" at priority ${priority}${routing ? ` (routed via ${describeRouting(routing)})` : ''}`);
+  console.log(`Added ${kind.kind} account "${name}" at priority ${priority}${routing ? ` (routed via ${describeRouting(routing)})` : ''}`);
   if (priority === APIKEY_DEFAULT_PRIORITY) {
     console.log(`A last resort: the key serves only while every account ahead of it is spent, and rotation leaves it as soon as one of them has quota again. \`teamclaude priority ${name} 0\` rotates it like the others.`);
   }
@@ -2734,6 +2751,10 @@ Commands:
                       the browser lands on can be pasted instead (--no-browser)
   login --api         Add an API key account (a last resort by default:
                       --priority <n> to place it, 0 = level with the rest)
+  login --opencode-go Add an OpenCode Go subscription key (clients use <proxy>/zen/go)
+  login --opencode-go --zen
+                      Add an OpenCode Zen pay-as-you-go key: serves the same
+                      requests once every Go key is spent (priority 100)
   env [--mitm|--no-mitm]
                       Print export lines to point Claude Code at the proxy, for
                       'eval "$(teamclaude env)"'. MITM forward-proxy unless the

@@ -158,6 +158,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       || mgr.messageThreads !== (diskAcct.messageThreads === true)) mgr.threadRefusalReported = false;
     mgr.upstream = diskAcct.upstream || null;
     mgr.modelMap = diskAcct.modelMap || null;
+    mgr.plan = diskAcct.plan || null;
     // Read per request like the two above (server.js rewriteRequestBody), and
     // missing from this sync until #374: an edit waited for a restart.
     mgr.stripRequestFields = diskAcct.stripRequestFields || null;
@@ -171,6 +172,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (cfgAcct) {
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
+      if (diskAcct.plan) cfgAcct.plan = diskAcct.plan; else delete cfgAcct.plan;
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;

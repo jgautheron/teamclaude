@@ -14,7 +14,7 @@ import { TopLevelFieldFinder, modelGlobMatches, parseRequestEffort, parseRequest
 import { conversationDigest, pinKeyFor } from './conversation.js';
 import { BodyWriter, truncationNote } from './request-log.js';
 import { upstreamFetch, upstreamPoolStatus } from './upstream-fetch.js';
-import { applyAuthHeaders, upstreamFor, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, isSubscriptionAccount, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
+import { applyAuthHeaders, upstreamFor, upstreamPathFor, isOpencodeZenAccount, rewritesBody, defaultHeadersTimeoutFor, providerForPath, providerForHost, interceptHostsFor, providerOf, canServeProvider, DEFAULT_PROVIDER, PROVIDERS } from './provider.js';
 import { tunnelTls } from './sx.js';
 import { createEgressGuard } from './egress-guard.js';
 import { isRoutingFailure, describeRouting } from './account-routing.js';
@@ -26,6 +26,7 @@ import { responsesEventUsage, isResponsesBody, normalizeResponsesUsage } from '.
 import { classificationPath } from './classification-path.js';
 import { serveManagementMcp } from './mcp-tools.js';
 import { codexSpentWindows, isAccountWideCodexWindow } from './codex-quota.js';
+import { fetchBackendQuota } from './backend-quota.js';
 import { atomicConfigUpdate } from './config.js';
 import { ConfigOpError, setThreshold, thresholdRatio } from './config-ops.js';
 import { envVar, legacyControlUrl } from './brand.js';
@@ -1348,6 +1349,35 @@ export function clientPassthroughOrigin({ authority, url, config, accounts = [] 
 // header parser would otherwise let C1 control bytes through untouched.
 const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
 
+// How long an OpenCode account that refused for quota sits out, in seconds:
+// to the latest reset among its spent windows, bounded like any quota hold so
+// a monthly window is re-checked hourly rather than trusted for weeks.
+const OPENCODE_HOLD_MAX_SECONDS = 3600;
+const OPENCODE_HOLD_UNREAD_SECONDS = 300;
+
+/**
+ * The hold for an OpenCode account that answered `status` (429 or 402), or
+ * null when the refusal is a plain throttle the 429 path below should handle.
+ * Reads the Go plan's usage endpoint once, and stores the reading.
+ * @param {any} account
+ * @param {number} status
+ * @param {any} accountManager
+ * @returns {Promise<number|null>}
+ */
+async function opencodeHoldSeconds(account, status, accountManager) {
+  if (status === 402) return OPENCODE_HOLD_MAX_SECONDS;
+  if (isOpencodeZenAccount(account)) return null;
+  const reading = await fetchBackendQuota(account).catch(() => null);
+  if (!reading || 'error' in reading) return OPENCODE_HOLD_UNREAD_SECONDS;
+  accountManager.applyBackendQuota(account.index, reading);
+  const spentResets = Object.values(reading.windows || {})
+    .filter((w) => w.utilization >= 1)
+    .map((w) => w.resetAt ?? Date.now() + OPENCODE_HOLD_MAX_SECONDS * 1000);
+  if (spentResets.length === 0) return null;
+  const seconds = Math.ceil((Math.max(...spentResets) - Date.now()) / 1000);
+  return Math.min(Math.max(seconds, 60), OPENCODE_HOLD_MAX_SECONDS);
+}
+
 /** The session id a request carries, or null when the header is absent or
  *  malformed — a malformed one is treated as no session, not rejected.
  *
@@ -1355,9 +1385,10 @@ const SESSION_ID_SHAPE = /^[A-Za-z0-9._-]{1,128}$/;
  *  Reading only the first left every Codex request untagged, so
  *  `distributeSessions` had nothing to place and a Codex pool stayed on one
  *  account until the switch threshold. The specific header wins when both are
- *  present: `session-id` is generic enough for a proxy in front to set. */
+ *  present: `session-id` is generic enough for a proxy in front to set.
+ *  OpenCode Go clients (pi, opencode) send `x-opencode-session`. */
 export function clientSessionId(headers) {
-  const raw = headers['x-claude-code-session-id'] ?? headers['session-id'];
+  const raw = headers['x-claude-code-session-id'] ?? headers['session-id'] ?? headers['x-opencode-session'];
   return typeof raw === 'string' && SESSION_ID_SHAPE.test(raw) ? raw : null;
 }
 
@@ -2957,8 +2988,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // api.anthropic.com with a Claude token. Subscriptions only: an API-key
   // account is metered capacity with no tie to a caller, so a pin to one stands.
   const pinnedWrongProvider = pinned
-    && isSubscriptionAccount(pinned)
-    && providerOf(pinned) !== (ctx.provider || DEFAULT_PROVIDER);
+    && !canServeProvider(pinned, ctx.provider || DEFAULT_PROVIDER);
   // The hop's destination was picked by pickAlternate against this request's
   // own exclusions, and is taken as-is: re-selecting here would walk the fleet
   // cursor onto it, which is exactly the move a detour must not make (#286).
@@ -2985,7 +3015,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
       type: 'error',
       error: {
         type: 'invalid_request_error',
-        message: `Pinned account "${pinned.name}" is a ${providerOf(pinned)} subscription and cannot serve a ${ctx.provider} request.`,
+        message: `Pinned account "${pinned.name}" is a ${providerOf(pinned)} account and cannot serve a ${ctx.provider} request.`,
       },
     }));
     return;
@@ -3191,7 +3221,7 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
   // needs ChatGPT-Account-Id to scope the token to one account.
   applyAuthHeaders(headers, account);
 
-  const upstreamUrl = `${upstreamFor(account, upstream)}${req.url}`;
+  const upstreamUrl = `${upstreamFor(account, upstream)}${upstreamPathFor(account, req.url)}`;
   const method = req.method;
 
   // An upstream that keeps no thread state would receive only this turn's delta
@@ -3335,6 +3365,23 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // this is what lets a revalidation probe (a throttled account selected by
     // _selectProbe) clear its own hold and return the fleet to service.
     if (upstreamRes.status !== 429) accountManager.clearRateLimited(account.index);
+
+    // OpenCode states no limits on its responses: a spent Go plan answers 429
+    // and a Zen key out of credits 402. Both are the account, not the request,
+    // so it is held and the request moves to the next key. A Go 429 whose
+    // usage reading shows nothing spent is a plain throttle and falls through.
+    if (providerOf(account) === 'opencode-go' && (upstreamRes.status === 429 || upstreamRes.status === 402)
+        && retryCount < maxRetries && !res.headersSent) {
+      const hold = await opencodeHoldSeconds(account, upstreamRes.status, accountManager);
+      if (hold != null) {
+        await upstreamRes.body?.cancel();
+        console.log(`[TeamClaude] OpenCode ${upstreamRes.status === 402 ? 'credits exhausted' : 'plan limit reached'} on "${safeLine(account.name, 64)}" — holding ${hold}s and switching account`);
+        accountManager.markRateLimited(account.index, hold);
+        ctx.tried.add(account.index);
+        if (clientGone(res)) { ctx.abandoned = true; return; }
+        return forwardRequest(req, res, body, accountManager, upstream, retryCount + 1, hooks, reqId, ctx, logDir, sx, route);
+      }
+    }
 
     // Two kinds of 429 are handled differently below: a quota rejection rotates
     // to another account; a transient rate-limit throttle pauses + retries the

@@ -496,6 +496,43 @@ held to a 10-second budget, because the waiting client's patience for the
 response head is finite and the retry needs the rest of it. Every attempt and outcome is
 logged.
 
+## OpenCode Go accounts
+
+[OpenCode Go](https://opencode.ai/docs/go) is a monthly plan that gives an API key for a set of open coding models. TeamClaude pools several Go keys and moves to the next one when a key reaches its plan limit. Zen pay-as-you-go keys can sit behind them as a metered fallback.
+
+Add a key from each Go or Go Plus subscription:
+
+```bash
+teamclaude login --opencode-go                # prompts for the key; priority 0
+teamclaude login --opencode-go --zen          # a Zen pay-as-you-go key; priority 100
+```
+
+Or write the entries in the config:
+
+```json
+{ "name": "go-1", "type": "apikey", "provider": "opencode-go", "apiKey": "sk-..." }
+{ "name": "zen-1", "type": "apikey", "provider": "opencode-go", "plan": "zen", "apiKey": "sk-...", "priority": 100 }
+```
+
+Point the client at `<proxy>/zen/go` and give it any key. For pi, put this in `~/.pi/agent/models.json` and keep a placeholder `opencode-go` key in `auth.json`:
+
+```json
+{ "providers": { "opencode-go": { "baseUrl": "http://127.0.0.1:3456/zen/go" } } }
+```
+
+How requests are served:
+
+- The request path decides the pool. Requests under `/zen/go/` are served only by OpenCode accounts, and OpenCode accounts never serve Claude or Codex requests.
+- The path is forwarded to `https://opencode.ai` unchanged. A path without `/v1` (`/zen/go/chat/completions`) gets it added, so one base URL serves the Anthropic-shaped and the OpenAI-shaped models.
+- A Zen key receives the same request on Zen's own endpoints (`/zen/v1/...`) and is billed from credits.
+- The `x-opencode-session` header pins a conversation to one key, which keeps its prompt cache.
+
+When a Go key answers 429, the proxy reads the plan's usage (`/zen/go/v1/usage`). If a window is spent, the key is held until that window resets, at most one hour, and the request moves to the next key. If no window is spent, the 429 is treated as an ordinary rate limit. A Zen key that answers 402 (no credits) is held for an hour. A rejected key (401) follows the [API key cooldown](#when-the-key-is-rejected-401).
+
+With the quota probe on, `teamclaude status` shows each Go key's 5-hour, weekly and monthly usage.
+
+If **Extra usage** is turned on for a Go workspace, that key pays from Zen credits after its limit and never answers 429, so rotation does not leave it.
+
 ## Claude banked usage-limit resets
 
 Claude sometimes grants an account a **banked usage-limit reset**, shown under

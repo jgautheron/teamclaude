@@ -377,6 +377,9 @@ function makeAccount(acct, index, listener = null) {
     autoRedeemReset: acct.autoRedeemReset !== false,
     upstream: acct.upstream || null,
     modelMap: acct.modelMap || null,
+    // OpenCode only: 'zen' marks a pay-as-you-go key, anything else a Go
+    // subscription key (provider.js upstreamPathFor).
+    plan: acct.plan || null,
     // Fields to drop from request bodies for this account (third-party upstreams
     // that reject e.g. `context_management`). See server.js stripBodyFields.
     stripRequestFields: acct.stripRequestFields || null,
