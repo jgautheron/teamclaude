@@ -25,6 +25,7 @@ import { resolveAccounts } from './resolve-accounts.js';
 import { loginCodex, startCodexLogin } from './codex-auth.js';
 import { isRemoteSession, openBrowser, PANEL_LOGIN_TIMEOUT_MS } from './login-flow.js';
 import { providerOf } from './provider.js';
+import { hasBackendQuota } from './backend-quota.js';
 import { syncAccountsFromDisk } from './sync-accounts.js';
 import { mergeAccountsForSave, syncRefreshedTokens, removedAccountIds, clearRemovedAccountIds, clearAddedAccountIds, markAccountRemoved, configIndexFor } from './account-pairing.js';
 import { ensureAccountIds } from './account-id.js';
@@ -989,6 +990,13 @@ async function serverCommand() {
   // is already shared with the server created above.
   hooks.probeQuota = () => prober?.probeAll();
   prober.start();
+  // Go plan usage only refreshes after a served request, so read it once now
+  // to show it from the start. The periodic probe already does this when on.
+  if (!(config.quotaProbeSeconds > 0)) {
+    for (const account of accountManager.accounts) {
+      if (providerOf(account) === 'opencode-go' && !account.disabled && hasBackendQuota(account)) prober.probeAccount(account).catch(() => {});
+    }
+  }
   // A money cap (accounts[].maxSpend) is judged against the month-to-date
   // figure only the probe refreshes — a response carries none — so with the
   // probe off it binds only after a manual `p` refresh. Said once at start,

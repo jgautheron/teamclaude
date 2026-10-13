@@ -1378,6 +1378,27 @@ async function opencodeHoldSeconds(account, status, accountManager) {
   return Math.min(Math.max(seconds, 60), OPENCODE_HOLD_MAX_SECONDS);
 }
 
+// A Go response carries no quota headers, so its plan usage is re-read in the
+// background after a served request, at most once a minute per account.
+const OPENCODE_USAGE_REFRESH_MS = 60_000;
+/** @type {WeakMap<object, number>} */
+const opencodeUsageReadAt = new WeakMap();
+
+/**
+ * Refresh a Go account's plan usage without delaying the response. Never throws.
+ * @param {any} account
+ * @param {any} accountManager
+ */
+function refreshOpencodeUsage(account, accountManager) {
+  if (providerOf(account) !== 'opencode-go' || isOpencodeZenAccount(account)) return;
+  const now = Date.now();
+  if (now - (opencodeUsageReadAt.get(account) ?? 0) < OPENCODE_USAGE_REFRESH_MS) return;
+  opencodeUsageReadAt.set(account, now);
+  fetchBackendQuota(account)
+    .then((reading) => accountManager.applyBackendQuota(account.index, reading))
+    .catch(() => {});
+}
+
 /** The session id a request carries, or null when the header is absent or
  *  malformed — a malformed one is treated as no session, not rejected.
  *
@@ -3359,7 +3380,10 @@ export async function forwardRequest(req, res, body, accountManager, upstream, r
     // And a response that is not an error is proof its API key works: the 401
     // cooldown and the count behind its length start over (#473). Only that —
     // a 429 or a 5xx says nothing about the key either way.
-    if (upstreamRes.status < 400) accountManager.clearCredentialRejected(account.index);
+    if (upstreamRes.status < 400) {
+      accountManager.clearCredentialRejected(account.index);
+      refreshOpencodeUsage(account, accountManager);
+    }
 
     // Any non-429 response is live proof a rate-limit hold no longer binds —
     // this is what lets a revalidation probe (a throttled account selected by

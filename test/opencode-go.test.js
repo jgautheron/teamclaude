@@ -129,6 +129,17 @@ test('a spent Go key is held until its window resets and the request moves to th
   });
 });
 
+test('a served Go request refreshes the plan usage in the background, at most once a minute', async () => {
+  await withGateway([go('g1')], (key) => [200, { ok: key }], async ({ port, seen, am }) => {
+    assert.equal((await chat(port)).status, 200);
+    assert.equal((await chat(port)).status, 200);
+    const g1 = am.accounts.find(a => a.name === 'g1');
+    for (let i = 0; i < 50 && !g1.quota.backend; i++) await new Promise(r => setTimeout(r, 10));
+    assert.equal(g1.quota.backend?.windows?.fiveHour?.utilization, 1);
+    assert.equal(seen.filter(s => s.url.endsWith('/usage')).length, 1);
+  });
+});
+
 test('once every Go key is spent, a Zen key serves the request on Zen\'s path; a 402 there rotates too', async () => {
   const answer = (key) => key === 'k-z2' ? [200, { ok: key }] : key === 'k-z1' ? [402, { error: { message: 'no credits' } }] : [429, {}];
   await withGateway([go('g1'), zen('z1'), zen('z2')], answer, async ({ port, seen }) => {
