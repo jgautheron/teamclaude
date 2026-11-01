@@ -103,7 +103,11 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     for (const field of /** @type {const} */ (['organizationType', 'rateLimitTier', 'seatTier', 'hasClaudeMax', 'hasClaudePro'])) {
       if (diskAcct[field] != null) mgr[field] = diskAcct[field];
     }
-    if (diskAcct.name && mgr.name !== diskAcct.name) mgr.name = diskAcct.name;
+    if (diskAcct.name && mgr.name !== diskAcct.name) {
+      // A session pin names its account, so it follows the rename (#543).
+      accountManager.sessionPins?.rename(mgr.name, diskAcct.name);
+      mgr.name = diskAcct.name;
+    }
     if (diskAcct.priority != null && mgr.priority !== diskAcct.priority) mgr.priority = diskAcct.priority;
     // A list position edited on disk applies on reload for the same reason a
     // priority edit does, and `null` rather than `??` so deleting the field
@@ -158,6 +162,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       || mgr.messageThreads !== (diskAcct.messageThreads === true)) mgr.threadRefusalReported = false;
     mgr.upstream = diskAcct.upstream || null;
     mgr.modelMap = diskAcct.modelMap || null;
+    mgr.plan = diskAcct.plan || null;
     // Read per request like the two above (server.js rewriteRequestBody), and
     // missing from this sync until #374: an edit waited for a restart.
     mgr.stripRequestFields = diskAcct.stripRequestFields || null;
@@ -171,6 +176,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
     if (cfgAcct) {
       if (diskAcct.upstream) cfgAcct.upstream = diskAcct.upstream; else delete cfgAcct.upstream;
       if (diskAcct.modelMap) cfgAcct.modelMap = diskAcct.modelMap; else delete cfgAcct.modelMap;
+      if (diskAcct.plan) cfgAcct.plan = diskAcct.plan; else delete cfgAcct.plan;
       if (diskAcct.stripRequestFields) cfgAcct.stripRequestFields = diskAcct.stripRequestFields; else delete cfgAcct.stripRequestFields;
       if (diskAcct.messageThreads === true) cfgAcct.messageThreads = true; else delete cfgAcct.messageThreads;
       if (diskAcct.maxUsage != null) cfgAcct.maxUsage = diskAcct.maxUsage; else delete cfgAcct.maxUsage;
@@ -213,7 +219,8 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
 
     if (freshCred.accessToken) {
       const changed = mgr.credential !== freshCred.accessToken ||
-        mgr.refreshToken !== freshCred.refreshToken;
+        // The manager keeps a missing refresh token as null, the disk entry as undefined.
+        (mgr.refreshToken || null) !== (freshCred.refreshToken || null);
       // Don't overwrite in-memory credentials with staler ones from disk
       // (e.g. after a TUI import updated the AM before saveConfig wrote to disk)
       const diskIsStaler = freshCred.expiresAt && mgr.expiresAt &&
@@ -228,6 +235,7 @@ export async function syncAccountsFromDisk(diskConfig, memConfig, accountManager
       // A different key is a different credential: the 401 hold was about the
       // old one, and the operator who just fixed it should not wait it out.
       accountManager.clearCredentialRejected(mgr.index);
+      accountManager.clearBillingRejected(mgr.index);
       console.log(`[TeamClaude] Updated API key for "${safeLine(mgr.name, 64)}"`);
     }
   }

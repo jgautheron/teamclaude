@@ -18,6 +18,7 @@
 
 import { proxyFetch } from './upstream-fetch.js';
 import { safeLine } from './safe-text.js';
+import { upstreamFor, providerOf, isOpencodeZenAccount } from './provider.js';
 
 // A balance reply is a few hundred bytes. The host it comes from is whatever
 // `account.upstream` names, so bound the read the way server.js bounds a
@@ -41,9 +42,12 @@ const RESPONSE_LIMIT = 64 * 1024;
 // Z.ai publishes the coding plan's windows at /api/monitor/usage/quota/limit:
 // `{ code, data: { level, limits: [...] } }`, where each TOKENS_LIMIT row is one
 // window — `unit: 3, number: 5` the five-hour one, `unit: 6, number: 1` the
-// weekly one — carrying `percentage` (0-100, used) and `nextResetTime` (ms). A
-// TIME_LIMIT row is the monthly MCP-tool allowance and is not a token quota,
-// so it is left out. Both windows go into one reading: the bar is the fuller
+// weekly one — carrying `percentage` (0-100, used) and `nextResetTime` (ms).
+// Newer plans answer the same windows as CREDIT_LIMIT rows, which also carry
+// `currentValue` of `usage` credits: their `percentage` is a whole number
+// (1 for 184 of 12000), so the ratio is the finer reading. Should a reply
+// carry both kinds for one window, the fuller one stands. A TIME_LIMIT row is
+// the monthly MCP-tool allowance and is not a token quota, so it is left out. Both windows go into one reading: the bar is the fuller
 // of the two — the one that decides whether the account can serve — and the
 // text names each with its reset.
 const ZAI = {
@@ -55,15 +59,26 @@ const ZAI = {
     /** @type {Array<{ name: string, used: number, resetAt: number|null }>} */
     const windows = [];
     for (const row of limits) {
-      if (row?.type !== 'TOKENS_LIMIT') continue;
-      const pct = Number(row.percentage);
-      if (!Number.isFinite(pct)) continue;
+      if (row?.type !== 'TOKENS_LIMIT' && row?.type !== 'CREDIT_LIMIT') continue;
+      const spent = Number(row.currentValue);
+      const allowance = Number(row.usage);
+      const fraction = row.type === 'CREDIT_LIMIT' && Number.isFinite(spent) && Number.isFinite(allowance) && allowance > 0
+        ? spent / allowance
+        : Number(row.percentage) / 100;
+      if (!Number.isFinite(fraction)) continue;
       const name = row.unit === 3 && row.number === 5 ? '5h'
         : row.unit === 6 && row.number === 1 ? 'week'
         : null;
       if (!name) continue;
       const reset = Number(row.nextResetTime);
-      windows.push({ name, used: Math.min(1, Math.max(0, pct / 100)), resetAt: Number.isFinite(reset) && reset > 0 ? reset : null });
+      const used = Math.min(1, Math.max(0, fraction));
+      const resetAt = Number.isFinite(reset) && reset > 0 ? reset : null;
+      const prev = windows.find(w => w.name === name);
+      if (prev) {
+        if (used > prev.used) Object.assign(prev, { used, resetAt });
+        continue;
+      }
+      windows.push({ name, used, resetAt });
     }
     if (!windows.length) return null;
     const text = windows.map(w => {
@@ -224,6 +239,34 @@ const KIMI = {
   },
 };
 
+// OpenCode Go: GET /zen/go/v1/usage answers `{ usage: { rolling, weekly,
+// monthly } }`, each `{ status, percent (0-100, used), resetsAt (ISO) }`. The
+// rolling window is the 5-hour one. A status other than "ok" is read as spent
+// whatever the percent says, since it is what the gateway refuses on.
+const OPENCODE_GO = {
+  host: 'opencode.ai',
+  path: '/zen/go/v1/usage',
+  parse(/** @type {any} */ body) {
+    const usage = body?.usage && typeof body.usage === 'object' ? body.usage : null;
+    if (!usage) return null;
+    /** @type {BackendQuotaWindows} */
+    const windows = {};
+    const parts = [];
+    for (const [key, name, w] of /** @type {const} */ ([['fiveHour', '5h', usage.rolling], ['weekly', 'week', usage.weekly], ['monthly', 'month', usage.monthly]])) {
+      const pct = Number(w?.percent);
+      if (!w || !Number.isFinite(pct)) continue;
+      const utilization = w.status === 'ok' ? Math.min(1, Math.max(0, pct / 100)) : 1;
+      const reset = Date.parse(w.resetsAt);
+      const resetAt = Number.isFinite(reset) ? reset : null;
+      windows[key] = { utilization, resetAt };
+      const until = resetAt ? formatUntil(resetAt - Date.now()) : '';
+      parts.push(`${name} ${Math.round(utilization * 100)}%${until ? ` (resets ${until})` : ''}`);
+    }
+    if (!parts.length) return null;
+    return { label: 'Plan', text: parts.join(' · '), utilization: Math.max(...Object.values(windows).map(w => w.utilization)), windows };
+  },
+};
+
 /**
  * @typedef {Object} BackendQuotaProvider
  * @property {string} host  the upstream host this entry answers for (exact match)
@@ -322,6 +365,7 @@ const PROVIDERS = [
   { host: 'api.kimi.ai', ...KIMI },
   { host: 'api.moonshot.ai', ...moonshot('$') },
   { host: 'api.moonshot.cn', ...moonshot('¥') },
+  OPENCODE_GO,
 ];
 
 /**
@@ -342,7 +386,27 @@ export function providerFor(upstream) {
  * @param {Record<string, any>|null|undefined} account
  */
 export function hasBackendQuota(account) {
-  return !!account?.upstream && !!providerFor(account.upstream);
+  return !!account && !!backendUpstream(account) && !!backendProviderFor(account);
+}
+
+/**
+ * The reading an account's backend publishes. An OpenCode account reads its
+ * plan however its `upstream` is spelled; any other is known by its host.
+ * @param {Record<string, any>} account
+ */
+function backendProviderFor(account) {
+  return providerOf(account) === 'opencode-go' ? OPENCODE_GO : providerFor(backendUpstream(account));
+}
+
+/**
+ * The origin a backend reading is fetched from: the account's own `upstream`,
+ * or its provider's default for a provider that has one (OpenCode). A Zen
+ * pay-as-you-go key has no plan to read.
+ * @param {Record<string, any>|null|undefined} account
+ */
+function backendUpstream(account) {
+  if (!account || isOpencodeZenAccount(account)) return null;
+  return account.upstream || (providerOf(account) === 'opencode-go' ? upstreamFor(account, null) : null);
 }
 
 /**
@@ -355,10 +419,13 @@ export function hasBackendQuota(account) {
  * @param {{ fetchImpl?: Function, timeoutMs?: number }} [opts]
  */
 export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeoutMs = 10_000 } = {}) {
-  const provider = providerFor(account?.upstream);
-  if (!provider || !account?.credential) return null;
+  const upstream = backendUpstream(account);
+  if (!account || !upstream || !account.credential) return null;
+  /** @type {BackendQuotaProvider|null} */
+  const provider = backendProviderFor(account);
+  if (!provider) return null;
 
-  const url = new URL(provider.path, account.upstream).toString();
+  const url = new URL(provider.path, upstream).toString();
   const signal = AbortSignal.timeout(timeoutMs);
   const headers = {
     Accept: 'application/json',
@@ -384,7 +451,7 @@ export async function fetchBackendQuota(account, { fetchImpl = proxyFetch, timeo
       // zero is what a healthy subscription account reads, and '$0.00' would
       // mask the monitor having said nothing we understand.
       try {
-        const bres = await fetchImpl(provider.balance.url(account.upstream), {
+        const bres = await fetchImpl(provider.balance.url(upstream), {
           headers,
           signal: AbortSignal.timeout(Math.min(timeoutMs, 5000)),
           routing: account.routing ?? null,
