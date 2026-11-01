@@ -15,7 +15,7 @@
 // operator/OAuth-derived, but they still never reach innerHTML.
 
 import { createHash } from 'node:crypto';
-import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, showSessionRow } from './status-renderer.js';
+import { UNAVAILABLE_TEXT, RESET_CREDIT_MAX_AGE_MS, outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow } from './status-renderer.js';
 import { USAGE_WINDOWS } from './client-usage.js';
 
 export function renderDashboardHtml() {
@@ -166,6 +166,31 @@ export function providerLabel(provider) {
   return provider || 'Unknown';
 }
 
+/**
+ * The account cards split by provider, for a fleet that mixes them. Claude
+ * accounts come first, then each other provider in the order its first account
+ * appears; within a group the payload's order is kept, since that is the
+ * rotation order. An account with no provider is an Anthropic one, as the
+ * server treats it. A single-provider fleet is one group the page draws without
+ * a heading, so it looks as it did.
+ * @param {Array<Record<string, any>>|null|undefined} accounts
+ * @returns {{ provider: string, label: string, accounts: Array<Record<string, any>> }[]}
+ */
+export function accountGroups(accounts) {
+  /** @type {Record<string, Array<Record<string, any>>>} */
+  var by = Object.create(null);
+  /** @type {string[]} */
+  var order = [];
+  (accounts || []).forEach(function (a) {
+    var p = (a && a.provider) || 'anthropic';
+    if (!by[p]) { by[p] = []; order.push(p); }
+    by[p].push(a);
+  });
+  var first = order.indexOf('anthropic');
+  if (first > 0) { order.splice(first, 1); order.unshift('anthropic'); }
+  return order.map(function (p) { return { provider: p, label: providerLabel(p), accounts: by[p] }; });
+}
+
 // Every bucket switchThreshold can be keyed by, plus the short names the
 // threshold badge shows them under. Mirrors THRESHOLD_BUCKET_KEYS in model.js
 // and THRESHOLD_BUCKET_LABELS in status-renderer.js — duplicated rather than
@@ -303,6 +328,9 @@ export function accountBadges(account, current, currentAccounts, now, fleetThres
   // password-masked (describeRouting), and absent for an account on the fleet
   // path, which is the default and earns no badge.
   if (typeof a.routing === 'string' && a.routing) badges.push({ cls: 'meta routing', text: 'via ' + a.routing });
+  // Stays past the entitlement cooldown, until the account serves again.
+  var denial = a.entitlementDenial;
+  if (denial) badges.push({ cls: 'throttled', text: 'OAuth denied' + (denial.count > 1 ? ' \u00d7' + denial.count : '') });
   return badges;
 }
 
@@ -351,6 +379,14 @@ export function sessionRows(sessions) {
     row.total = row.cacheRead + row.cacheCreation + row.input + row.output;
     return row;
   });
+}
+
+// "pinned: 3f2a1b9c → api-1, 9d0e4c11 → work" — the sessions an operator held
+// on one account (`teamclaude switch --session`), or '' when there are none.
+/** @param {any} pins */
+export function sessionPinsText(pins) {
+  if (!Array.isArray(pins) || !pins.length) return '';
+  return 'pinned: ' + pins.map(function (p) { return (p && p.session || '?') + ' \u2192 ' + (p && p.account || '?'); }).join(', ');
 }
 
 export function filterSessionRows(rows, filters) {
@@ -679,12 +715,16 @@ export function problems(status) {
   }
 
   // Only the two states that do not clear themselves. `entitlement` is a
-  // five-minute cooldown and `upstream-rejected` is upstream's way of saying a
+  // cooldown of at most an hour and `upstream-rejected` is upstream's way of saying a
   // shared bucket is spent — both expire on their own, like `quota` and
   // `throttled`, and none of them wants a person.
   var ATTENTION = { error: 'needs a re-login', disabled: 'is disabled' };
   (s.accounts || []).forEach(function (a) {
-    var why = ATTENTION[a.unavailable];
+    // A refusal from upstream (account-refusal.js) is not cured by a re-login
+    // alone; any error code other than the two dead-token ones is one.
+    var code = a.errorReason && a.errorReason.code;
+    var refused = a.unavailable === 'error' && code && code !== 'refresh_rejected' && code !== 'credential_rejected';
+    var why = refused ? 'was refused by upstream' : ATTENTION[a.unavailable];
     if (why) out.push({ severity: 'warn', kind: 'account', text: 'Account ' + a.name + ' ' + why + '.' });
   });
 
@@ -724,9 +764,9 @@ export function usageFor(entry, view) {
 export const CARD_NOTE_MAX_AGE_MS = 60 * 1000;
 
 const SHARED_HELPERS = [
-  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, thresholdBadgeText, accountBadges, sessionRows, filterSessionRows, sortRows, uniqSorted,
+  scopedWeeklyRows, accountTokens, modelLabel, recentModelLabels, providerLabel, accountGroups, thresholdBadgeText, accountBadges, sessionRows, sessionPinsText, filterSessionRows, sortRows, uniqSorted,
   switchRequest, switchOutcome, accountControlRequest, accountControlOutcome, thresholdRequest, thresholdPercentText, thresholdOutcome, routeRows, problems, usageFor,
-  outsideSpendText, forecastText, showSessionRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
+  outsideSpendText, forecastText, fleetForecastText, showSessionRow, showWeeklyRow, callerCan, callerNotice, cardNoteKey, cardNoteFor, backendQuotaRows,
 ].map(fn => fn.toString()).join('\n\n');
 
 // The constants ride along: `problems` closes over the thresholds and
@@ -855,6 +895,12 @@ const PAGE = `<!doctype html>
   #keybox input { width: 100%; padding: 10px 12px; margin: 12px 0; background: var(--panel); border: 1px solid var(--line); border-radius: 6px; color: var(--text); font: inherit; }
   #keybox button { padding: 8px 20px; background: var(--accent); border: 0; border-radius: 6px; color: var(--panel); font: inherit; font-weight: 600; cursor: pointer; }
   footer { color: var(--dim); font-size: 12px; margin-top: 24px; }
+  /* A mixed Claude/Codex fleet: one framed group per provider, so the cards of
+     one kind read together however the accounts were added. */
+  .acctgroup { border: 1px solid var(--line); border-radius: 10px; padding: 10px 10px 2px; margin-bottom: 14px; }
+  .acctgroup .card { margin-bottom: 8px; }
+  .acctgroup-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; margin: 0 6px 8px; }
+  .acctgroup-head .name { font-size: 13px; }
 </style>
 <script>
 (function () {
@@ -1063,6 +1109,7 @@ ${SHARED_HELPERS}
     }
     card.appendChild(head);
     if (a.unavailable) card.appendChild(el('div', 'blocked', 'blocked: ' + (UNAVAILABLE_TEXT[a.unavailable] || a.unavailable)));
+    if (a.entitlementDenial) card.appendChild(el('div', 'blocked', 'denied: ' + (a.entitlementDenial.detail || 'OAuth entitlement denied') + ' \u00b7 first ' + fmtAgo(a.entitlementDenial.since)));
     var q = a.quota || {};
     var models = modelsRow(a.usage);
     if (q.unified5h != null || q.unified7d != null) {
@@ -1070,7 +1117,7 @@ ${SHARED_HELPERS}
       if (showSessionRow(q)) card.appendChild(quotaRow('Session', q.unified5h, q.unified5hReset));
       if (models) card.appendChild(models);
       models = null;
-      card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
+      if (showWeeklyRow(q)) card.appendChild(quotaRow('Weekly', q.unified7d, q.unified7dReset));
       // Model-scoped weekly buckets are learned from the usage endpoint rather
       // than declared, so hard-coding the two families that have dedicated
       // fields drew an incomplete picture the moment upstream metered a third.
@@ -1397,6 +1444,10 @@ ${SHARED_HELPERS}
     // one page saying "sessions" here and "conversations" there would read as
     // two different quantities rather than one counted twice.
     sum.appendChild(el('span', '', ' · ' + (sess.active || 0) + ' active / ' + (sess.known || 0) + ' known conversations' + (up ? ' · ' + up : '')));
+    var pinsText = sessionPinsText(s.sessionPins);
+    if (pinsText) sum.appendChild(el('span', 'pin', ' · ' + pinsText));
+    var fleetText = fleetForecastText(s.fleetForecast, Date.now());
+    if (fleetText) sum.appendChild(el('span', '', ' · ' + fleetText));
     var probe = s.probe || {};
     var probeBtn = document.getElementById('probe');
     probeBtn.textContent = probe.running ? 'Probe running…' : 'Probe quotas';
@@ -1404,10 +1455,23 @@ ${SHARED_HELPERS}
     var acc = document.getElementById('accounts');
     acc.textContent = '';
     var now = Date.now();
-    (s.accounts || []).forEach(function (a) {
-      var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
-      if (cn) acc.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
-      acc.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+    var groups = accountGroups(s.accounts);
+    groups.forEach(function (g) {
+      var box = acc;
+      if (groups.length > 1) {
+        box = el('section', 'acctgroup');
+        var head = el('div', 'acctgroup-head');
+        head.appendChild(el('span', 'name', g.label));
+        var cur = currentAccounts && currentAccounts[g.provider];
+        head.appendChild(el('span', 'tag', g.accounts.length + (g.accounts.length === 1 ? ' account' : ' accounts') + (cur ? ' · current ' + cur : '')));
+        box.appendChild(head);
+        acc.appendChild(box);
+      }
+      g.accounts.forEach(function (a) {
+        var cn = cardNoteFor(cardNotes, cardNoteKey(a), now);
+        if (cn) box.appendChild(el('div', 'cardnote ' + cn.kind, cn.text));
+        box.appendChild(renderAccount(a, s.currentAccount, currentAccounts, s.switchThreshold, s.switchThresholds, s.caller));
+      });
     });
     renderProblems(s);
     renderRoutes(s);
