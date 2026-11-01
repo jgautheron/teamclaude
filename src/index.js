@@ -1433,6 +1433,8 @@ async function loginCommand() {
   console.log('  1. Claude subscription  (Pro, Max, Team, Enterprise)');
   console.log('  2. Anthropic API key    (Console API billing)');
   console.log('  3. Codex subscription   (ChatGPT Plus, Pro, Team)');
+  console.log('  4. OpenCode Go key      (Go, Go Plus subscription)');
+  console.log('  5. OpenCode Zen key     (Pay-as-you-go fallback for Go)');
   console.log('');
   const choice = await new Promise(resolve => rl.question('Choice [1]: ', resolve));
   rl.close();
@@ -1441,6 +1443,8 @@ async function loginCommand() {
     case '3': await loginCodexCommand(); break;
     case '1': await loginOAuthCommand(); break;
     case '2': await loginApiCommand(); break;
+    case '4': await loginApiCommand(API_KEY_KINDS.opencodeGo); break;
+    case '5': await loginApiCommand(API_KEY_KINDS.opencodeZen); break;
     default:
       console.error(`Invalid choice: ${choice.trim()}`);
       process.exit(1);
